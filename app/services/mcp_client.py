@@ -1,3 +1,19 @@
+"""
+MindBridge MCP 工具客户端模块
+
+通过 MCP (Model Context Protocol) 协议调用 MindBridge 工具服务。
+
+调用链路（关闭工具队列时的备用方案）：
+1. 启动 MCP server 子进程（stdio 传输）
+2. 建立 ClientSession
+3. 按顺序调用工具：
+   - mindbridge_excel_report → 写入 Excel 台账
+   - mindbridge_case_create → 创建风险个案（MEDIUM/HIGH）
+   - mindbridge_alert_send → 发送预警通知（HIGH）
+
+注意：默认情况下系统使用异步工具队列（tool_queue）处理后处理任务，
+MCP client 仅在 tool_queue_enabled=false 时作为备用方案。
+"""
 from __future__ import annotations
 
 import os
@@ -11,14 +27,30 @@ from app.core.enums import RiskLevel
 
 
 class McpToolError(RuntimeError):
+    """MCP 工具调用异常。"""
     pass
 
 
 class MindBridgeMcpToolClient:
+    """
+    MCP 工具客户端。
+
+    通过 stdio 传输启动 MCP server 子进程，
+    调用 mindbridge_* 工具完成报告后处理。
+    """
+
     def __init__(self, settings: Settings):
         self.settings = settings
 
     async def handle_report(self, report_id: int, risk_level: str | None) -> list[str]:
+        """
+        处理心理报告的后处理工具调用。
+
+        根据风险等级决定调用哪些工具：
+        - 所有报告：Excel 台账写入
+        - MEDIUM/HIGH：创建风险个案
+        - HIGH：发送预警通知
+        """
         try:
             async with self._session() as session:
                 results = [
@@ -41,6 +73,12 @@ class MindBridgeMcpToolClient:
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[Any]:
+        """
+        创建 MCP ClientSession。
+
+        通过 stdio 传输启动 MCP server 子进程，
+        建立会话后 yield 给调用方使用。
+        """
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
@@ -64,6 +102,7 @@ class MindBridgeMcpToolClient:
                 yield session
 
     async def _call_tool(self, session: Any, name: str, arguments: dict[str, Any]) -> str:
+        """调用单个 MCP 工具。"""
         result = await session.call_tool(name, arguments=arguments)
         message = self._result_message(result)
         if getattr(result, "isError", False):
@@ -71,6 +110,7 @@ class MindBridgeMcpToolClient:
         return message
 
     def _result_message(self, result: Any) -> str:
+        """提取 MCP 工具调用结果的文本内容。"""
         parts = []
         for item in getattr(result, "content", []) or []:
             text = getattr(item, "text", None)
@@ -81,5 +121,6 @@ class MindBridgeMcpToolClient:
         return str(structured if structured is not None else result)
 
     def _extract_case_id(self, message: str) -> int | None:
+        """从工具返回消息中提取 caseId。"""
         match = re.search(r"caseId=(\d+)", message)
         return int(match.group(1)) if match else None

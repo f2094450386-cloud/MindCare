@@ -1,3 +1,25 @@
+"""
+MindBridge 异步工具队列模块
+
+实现心理报告后处理的异步任务队列，不阻塞学生端 SSE 流式回复。
+
+架构：
+- ToolQueueService: 任务入队（根据风险等级决定创建哪些任务）
+- ToolQueueWorker: 后台调度器（轮询 + 线程池执行）
+- RateLimiter: 邮件发送限流器（滑动窗口）
+- ToolGovernanceService: 执行前授权校验并落库审计记录（app/services/tool_governance.py）
+
+任务依赖链（由 enqueue_report 根据风险等级自动创建）：
+- EXCEL_REPORT: 独立，所有报告都创建
+- CASE_CREATE: 独立，MEDIUM/HIGH 风险创建
+- ALERT_SEND: 依赖 CASE_CREATE，HIGH 风险创建
+
+生命周期：PENDING → RUNNING → SUCCESS / DEAD
+重试策略：失败后按 attempts * retry_delay 延迟重试
+超过 max_attempts 后进入 dead_letter_records。
+
+服务启动时自动恢复上次中断的 RUNNING 任务为 PENDING。
+"""
 from __future__ import annotations
 
 import json
@@ -14,6 +36,7 @@ from app.core.config import Settings
 from app.core.database import SessionLocal
 from app.core.enums import RiskLevel, ToolJobKind, ToolJobStatus, ToolStatus
 from app.models.entities import DeadLetterRecord, ExcelRecord, PsychologicalReport, ToolJob
+from app.services.tool_governance import ToolGovernanceService
 from app.services.tools import ToolOrchestrationService
 
 
@@ -21,11 +44,25 @@ logger = logging.getLogger(__name__)
 
 
 class ToolQueueService:
+    """
+    工具队列入队服务。
+
+    根据风险等级决定创建哪些后处理任务。
+    使用 _find_or_create 保证幂等（同一 report_id + kind 不会重复创建）。
+    """
+
     def __init__(self, db: Session, settings: Settings):
         self.db = db
         self.settings = settings
 
     def enqueue_report(self, report_id: int, risk_level: str | None) -> list[ToolJob]:
+        """
+        为心理报告创建后处理任务。
+
+        所有报告都创建 EXCEL_REPORT 任务。
+        MEDIUM/HIGH 风险额外创建 CASE_CREATE。
+        HIGH 风险额外创建 ALERT_SEND（依赖 CASE_CREATE）。
+        """
         excel_job = self._find_or_create(ToolJobKind.EXCEL_REPORT.value, report_id)
         jobs = [excel_job]
         case_job = None
@@ -39,6 +76,7 @@ class ToolQueueService:
         return jobs
 
     def _find_or_create(self, kind: str, report_id: int, depends_on_job_id: int | None = None) -> ToolJob:
+        """查找或创建任务（幂等）。"""
         existing = (
             self.db.query(ToolJob)
             .filter(ToolJob.report_id == report_id, ToolJob.kind == kind)
@@ -63,16 +101,31 @@ class ToolQueueService:
 
 
 class RateLimiter:
+    """
+    滑动窗口限流器。
+
+    使用单调时钟的 deque 实现每分钟最多 N 次的限流。
+    用于控制邮件发送频率，防止短时间内发送过多邮件。
+    """
+
     def __init__(self, limit_per_minute: int):
         self.limit = max(0, limit_per_minute)
         self.events: deque[float] = deque()
         self.lock = threading.Lock()
 
     def allow(self) -> tuple[bool, float]:
+        """
+        检查是否允许本次操作。
+
+        返回 (allowed, retry_after)：
+        - allowed=True: 允许，retry_after=0
+        - allowed=False: 限流中，retry_after=等待秒数
+        """
         if self.limit <= 0:
             return True, 0.0
         now_ts = time.monotonic()
         with self.lock:
+            # 清理 60 秒前的旧事件
             while self.events and now_ts - self.events[0] >= 60.0:
                 self.events.popleft()
             if len(self.events) < self.limit:
@@ -83,6 +136,18 @@ class RateLimiter:
 
 
 class ToolQueueWorker:
+    """
+    工具队列后台调度器。
+
+    架构：
+    - dispatcher 线程：轮询 PENDING 任务，提交到线程池执行
+    - excel_executor: Excel 写入和个案创建线程池
+    - email_executor: 邮件发送线程池
+    - email_limiter: 邮件发送限流器
+
+    启动时自动恢复上次中断的 RUNNING 任务。
+    """
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.stop_event = threading.Event()
@@ -98,6 +163,7 @@ class ToolQueueWorker:
         self.email_limiter = RateLimiter(settings.alert_email_rate_limit_per_minute)
 
     def start(self) -> None:
+        """启动后台调度器。"""
         if not self.settings.tool_queue_enabled or self.dispatcher is not None:
             return
         self._recover_running_jobs()
@@ -105,6 +171,7 @@ class ToolQueueWorker:
         self.dispatcher.start()
 
     def stop(self) -> None:
+        """停止后台调度器。"""
         self.stop_event.set()
         if self.dispatcher is not None:
             self.dispatcher.join(timeout=5)
@@ -112,6 +179,7 @@ class ToolQueueWorker:
         self.email_executor.shutdown(wait=False, cancel_futures=True)
 
     def _loop(self) -> None:
+        """调度器主循环：轮询 + 执行。"""
         while not self.stop_event.is_set():
             try:
                 self._dispatch_once()
@@ -120,6 +188,11 @@ class ToolQueueWorker:
             self.stop_event.wait(self.settings.tool_queue_poll_interval_seconds)
 
     def _dispatch_once(self) -> None:
+        """
+        单次调度：取出一批 PENDING 任务，提交到线程池。
+
+        任务状态更新为 RUNNING 后提交执行。
+        """
         db = SessionLocal()
         try:
             now = datetime.utcnow()
@@ -141,19 +214,32 @@ class ToolQueueWorker:
             db.close()
 
     def _executor_for(self, job: ToolJob) -> ThreadPoolExecutor:
+        """根据任务类型选择线程池。"""
         if job.kind in {ToolJobKind.EXCEL_REPORT.value, ToolJobKind.CASE_CREATE.value}:
             return self.excel_executor
         return self.email_executor
 
     def _run_job(self, job_id: int) -> None:
+        """
+        执行单个任务。
+
+        流程：
+        1. 检查任务状态
+        2. 检查依赖是否就绪
+        3. 检查邮件限流（仅 ALERT_SEND）
+        4. 执行任务
+        5. 成功 → SUCCESS，失败 → 重试或死信
+        """
         db = SessionLocal()
         try:
             job = db.get(ToolJob, job_id)
             if job is None or job.status != ToolJobStatus.RUNNING.value:
                 return
+            # 依赖检查
             if not self._dependency_ready(db, job):
                 self._requeue(db, job, self._dependency_wait_reason(job), 2.0)
                 return
+            # 邮件限流检查
             if job.kind in {ToolJobKind.RISK_ALERT.value, ToolJobKind.ALERT_SEND.value}:
                 allowed, retry_after = self.email_limiter.allow()
                 if not allowed:
@@ -163,7 +249,16 @@ class ToolQueueWorker:
             job.updated_at = datetime.utcnow()
             db.add(job)
             db.commit()
-            self._execute(db, job)
+            # 执行前授权校验：根据报告风险等级判断该工具是否被允许执行，并落库审计记录
+            report = db.get(PsychologicalReport, job.report_id)
+            governance = ToolGovernanceService(db)
+            audit = governance.start_job(job, report)
+            try:
+                self._execute(db, job)
+            except Exception as exc:
+                governance.finish(audit, "FAILED", reason=str(exc))
+                raise
+            governance.finish(audit, "SUCCESS")
             job.status = ToolJobStatus.SUCCESS.value
             job.last_error = ""
             job.updated_at = datetime.utcnow()
@@ -178,6 +273,7 @@ class ToolQueueWorker:
             db.close()
 
     def _execute(self, db: Session, job: ToolJob) -> None:
+        """根据任务类型调用对应的工具方法。"""
         report = db.get(PsychologicalReport, job.report_id)
         if report is None:
             raise RuntimeError(f"report {job.report_id} not found")
@@ -204,6 +300,12 @@ class ToolQueueWorker:
         raise RuntimeError(f"unknown tool job kind: {job.kind}")
 
     def _dependency_ready(self, db: Session, job: ToolJob) -> bool:
+        """
+        检查任务的依赖是否就绪。
+
+        ALERT_SEND 依赖 CASE_CREATE 成功。
+        RISK_ALERT 依赖 Excel 写入成功。
+        """
         if job.kind not in {ToolJobKind.RISK_ALERT.value, ToolJobKind.ALERT_SEND.value}:
             return True
         if job.depends_on_job_id:
@@ -211,7 +313,6 @@ class ToolQueueWorker:
             return dependency is not None and dependency.status == ToolJobStatus.SUCCESS.value
         if job.kind == ToolJobKind.ALERT_SEND.value:
             from app.models.entities import RiskCase
-
             return db.query(RiskCase).filter(RiskCase.report_id == job.report_id).first() is not None
         return (
             db.query(ExcelRecord)
@@ -221,11 +322,13 @@ class ToolQueueWorker:
         )
 
     def _dependency_wait_reason(self, job: ToolJob) -> str:
+        """返回依赖未就绪的原因描述。"""
         if job.kind == ToolJobKind.ALERT_SEND.value:
             return "等待风险个案创建成功后再发送预警"
         return "等待 Excel 台账写入成功后再发送预警"
 
     def _requeue(self, db: Session, job: ToolJob, reason: str, delay_seconds: float) -> None:
+        """将任务重新入队（延迟执行）。"""
         job.status = ToolJobStatus.PENDING.value
         job.last_error = reason
         job.run_after = datetime.utcnow() + timedelta(seconds=max(1.0, delay_seconds))
@@ -234,6 +337,12 @@ class ToolQueueWorker:
         db.commit()
 
     def _fail_or_dead_letter(self, db: Session, job_id: int, exc: Exception) -> None:
+        """
+        处理任务失败。
+
+        未超过最大重试次数 → 重新入队（延迟递增）。
+        超过最大重试次数 → 标记为 DEAD，写入死信记录。
+        """
         job = db.get(ToolJob, job_id)
         if job is None:
             return
@@ -261,6 +370,12 @@ class ToolQueueWorker:
         db.commit()
 
     def _recover_running_jobs(self) -> None:
+        """
+        恢复上次中断的 RUNNING 任务。
+
+        服务重启后，上次处于 RUNNING 状态的任务可能未完成。
+        将它们重置为 PENDING 状态，等待重新执行。
+        """
         db = SessionLocal()
         try:
             rows = db.query(ToolJob).filter(ToolJob.status == ToolJobStatus.RUNNING.value).all()
@@ -275,10 +390,12 @@ class ToolQueueWorker:
             db.close()
 
 
+# 全局单例
 _worker: ToolQueueWorker | None = None
 
 
 def get_tool_queue_worker(settings: Settings) -> ToolQueueWorker:
+    """获取全局工具队列 Worker 单例。"""
     global _worker
     if _worker is None:
         _worker = ToolQueueWorker(settings)

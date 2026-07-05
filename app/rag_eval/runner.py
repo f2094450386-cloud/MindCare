@@ -1,3 +1,21 @@
+"""
+MindBridge RAG 评测模块
+
+对 RAG 知识库检索质量进行量化评估。
+
+评测指标：
+- Recall@K: 在 top-K 结果中是否命中相关文档（0/1）
+- Precision@K: top-K 结果中相关文档的比例
+- MRR (Mean Reciprocal Rank): 第一个相关结果的排名倒数
+- NDCG@K (Normalized Discounted Cumulative Gain): 排序质量
+- HitRate: 所有测试用例中命中相关文档的比例
+
+评测数据集：app/rag_eval/mindbridge-rag-eval.json
+评测报告：target/rag-eval-report.json
+
+使用方式：
+  AI_PROVIDER=mock python -m app.rag_eval.runner
+"""
 import json
 import math
 from datetime import datetime
@@ -10,6 +28,16 @@ from app.services.knowledge import KnowledgeService
 
 
 def evaluate() -> dict:
+    """
+    执行完整的 RAG 评测。
+
+    流程：
+    1. 初始化数据库和知识库
+    2. 加载评测数据集
+    3. 对每个测试用例执行检索
+    4. 计算各项指标
+    5. 输出评测报告
+    """
     settings = get_settings()
     create_schema()
     db = SessionLocal()
@@ -43,6 +71,19 @@ def evaluate() -> dict:
 
 
 def evaluate_case(service: KnowledgeService, case: dict, top_k: int) -> dict:
+    """
+    评测单个测试用例。
+
+    每个用例包含：
+    - id: 用例 ID
+    - question: 查询问题
+    - expectedSources: 期望命中的来源文件列表
+    - expectedTerms: 期望在结果中出现的关键词列表
+
+    相关性判断：
+    - 来源文件名在 expectedSources 中 → 相关
+    - 内容中包含 expectedTerms 中的任意关键词 → 相关
+    """
     retrieved = service.retrieve(case["question"], top_k)
     expected_sources = {source.lower() for source in case.get("expectedSources", [])}
     expected_terms = [term.lower() for term in case.get("expectedTerms", [])]
@@ -80,6 +121,7 @@ def evaluate_case(service: KnowledgeService, case: dict, top_k: int) -> dict:
 
 
 def is_relevant(source: str, content: str, expected_sources: set[str], expected_terms: list[str]) -> bool:
+    """判断检索结果是否相关。"""
     if source.lower() in expected_sources:
         return True
     lower = content.lower()
@@ -87,6 +129,12 @@ def is_relevant(source: str, content: str, expected_sources: set[str], expected_
 
 
 def ndcg(items: list[dict]) -> float:
+    """
+    计算 NDCG@K (Normalized Discounted Cumulative Gain)。
+
+    DCG = Σ(rel_i / log2(i + 1))
+    NDCG = DCG / IDCG（理想排序的 DCG）
+    """
     dcg = 0.0
     relevant = 0
     for index, item in enumerate(items):

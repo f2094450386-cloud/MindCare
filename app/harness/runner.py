@@ -1,3 +1,26 @@
+"""
+MindBridge 工程 Harness 测试运行器
+
+一键验证核心链路的集成测试框架。
+使用 mock AI、临时 SQLite、内存短期记忆，无需外部服务。
+
+测试套件：
+1. Risk Safety Harness: 高风险识别、报告生成、工具队列入队
+2. Agent Routing Harness: CHAT/CONSULT/RISK 路由和多 Agent 步骤验证
+3. Standard Skills Harness: Skill 加载、选择逻辑和交接摘要模板渲染
+4. RAG Harness: 基于评测集验证 Recall@K、MRR、NDCG、HitRate
+5. API Harness: 健康检查、认证授权、SSE 聊天、管理员接口
+6. Tool Queue Harness: Excel/Case/Alert 依赖、幂等、限流和死信
+
+使用方式：
+  python3 -m app.harness.runner
+  python3 -m app.harness.runner --suite risk --suite routing
+  python3 -m app.harness.runner --json
+
+报告输出：
+  target/harness/harness-report.json
+  target/harness/rag-eval-report.json
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,11 +38,13 @@ from typing import Callable
 
 
 class HarnessFailure(AssertionError):
+    """Harness 断言失败异常。"""
     pass
 
 
 @dataclass
 class CheckResult:
+    """单个测试套件的结果。"""
     name: str
     passed: bool
     details: dict = field(default_factory=dict)
@@ -28,6 +53,7 @@ class CheckResult:
 
 @dataclass
 class HarnessContext:
+    """Harness 运行上下文。"""
     root: Path
     target_dir: Path
     settings: object
@@ -38,6 +64,13 @@ class HarnessContext:
 
 
 class InMemoryShortTermMemoryStore:
+    """
+    内存短期记忆存储（替代 Redis）。
+
+    用于 harness 测试，避免依赖外部 Redis 服务。
+    所有数据存储在类变量 _messages 中。
+    写入前对内容做隐私脱敏，行为与 RedisShortTermMemoryStore 保持一致。
+    """
     _messages: dict[str, list[object]] = {}
 
     def __init__(self, settings):
@@ -54,13 +87,21 @@ class InMemoryShortTermMemoryStore:
 
     def append(self, session_public_id: str, role: str, content: str) -> None:
         from app.schemas.dtos import AiMessage
+        from app.services.privacy import PrivacySanitizer
 
         values = self._messages.setdefault(session_public_id, [])
-        values.append(AiMessage(role=role.lower(), content=content))
+        values.append(AiMessage(role=role.lower(), content=PrivacySanitizer().sanitize(content)))
         del values[:-self.settings.redis_memory_max_messages]
 
     def replace(self, session_public_id: str, messages: list[object]) -> None:
-        self._messages[session_public_id] = list(messages)[-self.settings.redis_memory_max_messages:]
+        from app.schemas.dtos import AiMessage
+        from app.services.privacy import PrivacySanitizer
+
+        privacy = PrivacySanitizer()
+        self._messages[session_public_id] = [
+            AiMessage(role=message.role, content=privacy.sanitize(message.content))
+            for message in list(messages)[-self.settings.redis_memory_max_messages:]
+        ]
 
     @classmethod
     def reset(cls) -> None:
@@ -68,6 +109,7 @@ class InMemoryShortTermMemoryStore:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Harness 主入口。"""
     parser = argparse.ArgumentParser(description="Run MindBridge engineering harness checks.")
     parser.add_argument(
         "--suite",
@@ -100,6 +142,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def configure_environment() -> None:
+    """
+    配置 harness 运行环境。
+
+    使用临时 SQLite 数据库、mock AI、自研 runtime、禁用向量库和工具队列。
+    """
     root = Path(__file__).resolve().parents[2]
     target_dir = root / "target" / "harness"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +168,7 @@ def configure_environment() -> None:
 
 
 def build_context() -> HarnessContext:
+    """构建 harness 运行上下文。"""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
@@ -142,6 +190,12 @@ def build_context() -> HarnessContext:
 
 
 def install_harness_patches() -> None:
+    """
+    安装 harness 补丁。
+
+    将 RedisShortTermMemoryStore 替换为 InMemoryShortTermMemoryStore，
+    避免测试依赖外部 Redis 服务。
+    """
     import app.agents.harness as harness_module
     import app.agents.runtime as runtime_module
 
@@ -150,6 +204,7 @@ def install_harness_patches() -> None:
 
 
 def reset_database(context: HarnessContext) -> None:
+    """重置数据库：删除所有表 → 重建 → 初始化默认数据。"""
     from app.core.bootstrap import seed_data
 
     context.database.Base.metadata.drop_all(bind=context.database.engine)
@@ -162,6 +217,7 @@ def reset_database(context: HarnessContext) -> None:
 
 
 def resolve_suites(requested: list[str] | None) -> list[tuple[str, Callable[[HarnessContext], dict]]]:
+    """解析要运行的测试套件。"""
     all_suites: list[tuple[str, Callable[[HarnessContext], dict]]] = [
         ("Risk Safety Harness", run_risk_safety_harness),
         ("Agent Routing Harness", run_agent_routing_harness),
@@ -186,6 +242,7 @@ def resolve_suites(requested: list[str] | None) -> list[tuple[str, Callable[[Har
 
 
 def run_check(name: str, fn: Callable[[HarnessContext], dict], context: HarnessContext) -> CheckResult:
+    """运行单个测试套件。"""
     try:
         return CheckResult(name=name, passed=True, details=fn(context))
     except HarnessFailure as exc:
@@ -198,7 +255,18 @@ def run_check(name: str, fn: Callable[[HarnessContext], dict], context: HarnessC
         )
 
 
+# ── 测试套件实现 ──────────────────────────────────────────────────
+
 def run_risk_safety_harness(context: HarnessContext) -> dict:
+    """
+    Risk Safety Harness: 高风险安全测试。
+
+    验证：
+    - 高风险消息（中/英文）→ 生成报告 + 工具队列
+    - 咨询消息 → 生成报告但不触发预警
+    - 普通消息 → 不生成报告
+    - 后台风险元数据不暴露给学生端
+    """
     from app.core.enums import RiskLevel, ToolJobKind
     from app.models.entities import PsychologicalReport, ToolJob, UserAccount
     from app.schemas.dtos import ChatRequest
@@ -268,6 +336,7 @@ def run_risk_safety_harness(context: HarnessContext) -> dict:
                         any(job.kind == ToolJobKind.CASE_CREATE.value for job in jobs),
                         f"{case['id']} did not enqueue case creation job",
                     )
+            # 验证后台风险元数据不暴露给学生
             forbidden = ["风险等级", "报告ID", "emotionScore", "HIGH_RISK"]
             expect(not any(term in token_text for term in forbidden), f"{case['id']} exposed backend risk metadata")
             observed.append({"id": case["id"], "report": report is not None, "assistantChars": len(token_text)})
@@ -278,6 +347,14 @@ def run_risk_safety_harness(context: HarnessContext) -> dict:
 
 
 def run_agent_routing_harness(context: HarnessContext) -> dict:
+    """
+    Agent Routing Harness: Agent 路由测试。
+
+    验证：
+    - CHAT 意图 → 只运行 CompanionAgent，不运行 KnowledgeAgent/RiskGuardianAgent
+    - CONSULT 意图 → 运行完整 Agent 链，检索知识
+    - RISK 意图 → 运行完整 Agent 链，风险等级为 HIGH
+    """
     from app.agents.harness import MindBridgeAgentHarness
     from app.core.enums import IntentType, RiskLevel
     from app.models.entities import ChatSession, UserAccount
@@ -338,6 +415,14 @@ def run_agent_routing_harness(context: HarnessContext) -> dict:
 
 
 def run_standard_skills_harness(context: HarnessContext) -> dict:
+    """
+    Standard Skills Harness: Skill 系统测试。
+
+    验证：
+    - 所有 7 个标准 Skill 都已加载
+    - Skill 选择逻辑正确（关键词触发）
+    - 交接摘要模板渲染正确
+    """
     from app.core.enums import EmotionLabel, IntentType, RiskLevel
     from app.models.entities import PsychologicalReport, UserAccount
     from app.services.skills import MindBridgeSkillLibrary
@@ -361,6 +446,7 @@ def run_standard_skills_harness(context: HarnessContext) -> dict:
     expect(not failed, f"standard skill load failures: {failed}")
     expect(all(item["path"].endswith("/SKILL.md") for item in statuses), "skill status did not expose SKILL.md paths")
 
+    # 验证 CONSULT 意图的 Skill 选择
     selected_names = MindBridgeSkillLibrary.response_skill_names(
         IntentType.CONSULT,
         RiskLevel.LOW,
@@ -375,6 +461,7 @@ def run_standard_skills_harness(context: HarnessContext) -> dict:
     ]:
         expect(name in selected_names, f"consult response did not select {name}")
 
+    # 验证 Skill 上下文注入
     context_text = MindBridgeSkillLibrary.response_skill_context(
         IntentType.CONSULT,
         RiskLevel.LOW,
@@ -382,6 +469,7 @@ def run_standard_skills_harness(context: HarnessContext) -> dict:
     )
     expect("应用 skill: anxiety_grounding_support" in context_text, "response context did not include standard skill body")
 
+    # 验证高风险 Skill 选择
     high_risk_names = MindBridgeSkillLibrary.response_skill_names(
         IntentType.RISK,
         RiskLevel.HIGH,
@@ -389,6 +477,7 @@ def run_standard_skills_harness(context: HarnessContext) -> dict:
     )
     expect(high_risk_names == ["supportive_response_baseline", "high_risk_safety_plan"], "high-risk skill selection changed")
 
+    # 验证交接摘要模板渲染
     report = PsychologicalReport(
         id=7,
         user_id=42,
@@ -421,6 +510,16 @@ def run_standard_skills_harness(context: HarnessContext) -> dict:
 
 
 def run_rag_harness(context: HarnessContext) -> dict:
+    """
+    RAG Harness: 知识检索质量测试。
+
+    验证：
+    - 评测集至少 50 个用例
+    - HitRate >= 0.95
+    - Recall@K >= 0.95
+    - MRR >= 0.75
+    - NDCG@K >= 0.75
+    """
     from app.rag_eval.runner import evaluate_case
     from app.services.knowledge import KnowledgeService
 
@@ -455,6 +554,17 @@ def run_rag_harness(context: HarnessContext) -> dict:
 
 
 def run_api_harness(context: HarnessContext) -> dict:
+    """
+    API Harness: HTTP 接口测试。
+
+    验证：
+    - 健康检查端点
+    - 学生认证和 profile
+    - Agent 状态接口
+    - SSE 聊天流
+    - 管理员权限隔离
+    - 知识库入库接口
+    """
     from fastapi.testclient import TestClient
 
     from app.main import create_app
@@ -479,20 +589,24 @@ def run_api_harness(context: HarnessContext) -> dict:
         expect(len(status_skills) >= 7, f"agent status exposed too few standard skills: {len(status_skills)}")
         expect(all(skill["path"].endswith("/SKILL.md") for skill in status_skills), "agent status did not expose standard skill paths")
 
+        # 管理员禁止发起学生对话
         admin_chat = client.post("/api/chat/stream", headers=admin_auth, json={"message": "hello"})
         expect(admin_chat.status_code == 403, f"admin chat should be forbidden, got {admin_chat.status_code}")
 
+        # 学生聊天流
         chat = client.post("/api/chat/stream", headers=student_auth, json={"message": "帮我解释一下 Python 函数。"})
         expect(chat.status_code == 200, f"student chat stream failed: {chat.status_code}")
         expect("event: meta" in chat.text and "event: done" in chat.text, "chat stream missing meta/done events")
         observed["chatStreamChars"] = len(chat.text)
 
+        # 权限隔离
         student_reports = client.get("/api/admin/reports", headers=student_auth)
         expect(student_reports.status_code == 403, f"student should not read admin reports: {student_reports.status_code}")
 
         admin_reports = client.get("/api/admin/reports", headers=admin_auth)
         expect(admin_reports.status_code == 200, f"admin reports failed: {admin_reports.status_code}")
 
+        # 知识库入库
         ingest = client.post(
             "/api/admin/knowledge",
             headers=admin_auth,
@@ -512,6 +626,18 @@ def run_api_harness(context: HarnessContext) -> dict:
 
 
 def run_tool_queue_harness(context: HarnessContext) -> dict:
+    """
+    Tool Queue Harness: 工具队列测试。
+
+    验证：
+    - 高风险报告创建 3 个任务（Excel + Case + Alert）
+    - Alert 任务依赖 Case 任务
+    - Excel 写入幂等性
+    - 个案创建幂等性
+    - 预警发送后个案状态更新
+    - 限流器行为
+    - 死信记录生成
+    """
     from app.core.enums import EmotionLabel, IntentType, RiskCaseStatus, RiskLevel, ToolJobKind, ToolJobStatus, ToolStatus
     from app.models.entities import DeadLetterRecord, PsychologicalReport, ToolJob, ChatSession, UserAccount
     from app.services.tool_queue import RateLimiter, ToolQueueService, ToolQueueWorker
@@ -541,6 +667,7 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         db.commit()
         db.refresh(report)
 
+        # 验证任务创建
         jobs = ToolQueueService(db, context.settings).enqueue_report(report.id, report.risk_level)
         expect(len(jobs) == 3, f"expected 3 jobs for high risk report, got {len(jobs)}")
         excel_job = next(job for job in jobs if job.kind == ToolJobKind.EXCEL_REPORT.value)
@@ -549,6 +676,7 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         expect(alert_job.depends_on_job_id == case_job.id, "alert job does not depend on case creation job")
         expect(not worker._dependency_ready(db, alert_job), "alert dependency should not be ready before case creation success")
 
+        # 验证幂等性
         tools = ToolOrchestrationService(db, context.settings)
         excel_record = tools.write_excel(report)
         expect(excel_record.status == ToolStatus.SUCCESS.value, f"Excel write failed: {excel_record.message}")
@@ -559,22 +687,26 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         second_case_record = tools.create_case(report)
         expect(second_case_record.id == case_record.id, "case creation is not idempotent")
 
+        # 验证依赖就绪
         case_job.status = ToolJobStatus.SUCCESS.value
         db.add(case_job)
         db.commit()
         expect(worker._dependency_ready(db, alert_job), "alert dependency was not ready after case creation success")
 
+        # 验证预警发送
         alert_record = tools.send_case_alert(case_record)
         expect(alert_record.status == ToolStatus.SUCCESS.value, f"alert notify failed: {alert_record.message}")
         db.refresh(case_record)
         expect(case_record.status == RiskCaseStatus.ALERT_SENT.value, "case did not move to ALERT_SENT after alert")
 
+        # 验证限流器
         limiter = RateLimiter(1)
         first_allowed, _ = limiter.allow()
         second_allowed, retry_after = limiter.allow()
         expect(first_allowed, "rate limiter rejected first event")
         expect(not second_allowed and retry_after > 0, "rate limiter did not throttle second event")
 
+        # 验证死信
         dead_job = ToolJob(
             report_id=report.id,
             kind=ToolJobKind.EXCEL_REPORT.value,
@@ -606,7 +738,10 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         db.close()
 
 
+# ── 辅助函数 ──────────────────────────────────────────────────────
+
 def collect_chat_stream(service, user, request) -> tuple[list[dict], str]:
+    """收集 SSE 流式聊天的所有事件和助手文本。"""
     async def collect() -> list[dict]:
         events = []
         async for chunk in service.stream_chat(user, request):
@@ -619,6 +754,7 @@ def collect_chat_stream(service, user, request) -> tuple[list[dict], str]:
 
 
 def parse_sse(chunk: str) -> list[dict]:
+    """解析 SSE 文本为事件列表。"""
     events = []
     for block in chunk.strip().split("\n\n"):
         if not block:
@@ -635,16 +771,19 @@ def parse_sse(chunk: str) -> list[dict]:
 
 
 def basic_auth(username: str, password: str) -> dict[str, str]:
+    """生成 Basic Auth 请求头。"""
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     return {"Authorization": f"Basic {token}"}
 
 
 def expect(condition: bool, message: str) -> None:
+    """断言辅助函数。"""
     if not condition:
         raise HarnessFailure(message)
 
 
 def write_report(context: HarnessContext, results: list[CheckResult]) -> dict:
+    """写入测试报告。"""
     report = {
         "createdAt": datetime.utcnow().isoformat(),
         "environment": {
@@ -671,6 +810,7 @@ def write_report(context: HarnessContext, results: list[CheckResult]) -> dict:
 
 
 def print_report(report: dict) -> None:
+    """打印测试报告到控制台。"""
     print("MindBridge Engineering Harness")
     print(f"Report: {report['reportPath']}")
     print("")
