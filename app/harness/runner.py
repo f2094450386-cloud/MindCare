@@ -145,7 +145,7 @@ def configure_environment() -> None:
     """
     配置 harness 运行环境。
 
-    使用临时 SQLite 数据库、mock AI、自研 runtime、禁用向量库和工具队列。
+    使用临时 SQLite 数据库、mock AI、事件驱动 runtime、禁用向量库和工具队列。
     """
     root = Path(__file__).resolve().parents[2]
     target_dir = root / "target" / "harness"
@@ -158,7 +158,7 @@ def configure_environment() -> None:
 
     os.environ["DATABASE_URL"] = f"sqlite:///{db_path.as_posix()}"
     os.environ["AI_PROVIDER"] = "mock"
-    os.environ["AGENT_FRAMEWORK"] = "custom"
+    os.environ["AGENT_FRAMEWORK"] = "event_driven_multi_agent"
     os.environ["KNOWLEDGE_VECTOR_ENABLED"] = "false"
     os.environ["KNOWLEDGE_VECTOR_REQUIRED"] = "false"
     os.environ["TOOL_QUEUE_ENABLED"] = "false"
@@ -196,11 +196,15 @@ def install_harness_patches() -> None:
     将 RedisShortTermMemoryStore 替换为 InMemoryShortTermMemoryStore，
     避免测试依赖外部 Redis 服务。
     """
+    import app.agents.event_driven_runtime as event_driven_runtime_module
     import app.agents.harness as harness_module
     import app.agents.runtime as runtime_module
+    import app.services.memory as memory_module
 
+    event_driven_runtime_module.RedisShortTermMemoryStore = InMemoryShortTermMemoryStore
     harness_module.RedisShortTermMemoryStore = InMemoryShortTermMemoryStore
     runtime_module.RedisShortTermMemoryStore = InMemoryShortTermMemoryStore
+    memory_module.RedisShortTermMemoryStore = InMemoryShortTermMemoryStore
 
 
 def reset_database(context: HarnessContext) -> None:
@@ -351,16 +355,17 @@ def run_agent_routing_harness(context: HarnessContext) -> dict:
     Agent Routing Harness: Agent 路由测试。
 
     验证：
-    - CHAT 意图 → 只运行 CompanionAgent，不运行 KnowledgeAgent/RiskGuardianAgent
-    - CONSULT 意图 → 运行完整 Agent 链，检索知识
-    - RISK 意图 → 运行完整 Agent 链，风险等级为 HIGH
+    - 默认运行真正的 event_driven_multi_agent，而不是强制 custom
+    - CHAT 不运行 ContextAgent/RAG，但仍经过 SafetyAgent 审查
+    - CONSULT/RISK 运行 ContextAgent、RAG 和 Skill；RISK 触发 SAFETY_OVERRIDE
+    - custom/langgraph 兼容链路仍可运行
     """
     from app.agents.harness import MindBridgeAgentHarness
     from app.core.enums import IntentType, RiskLevel
     from app.models.entities import ChatSession, UserAccount
     from app.schemas.dtos import ChatRequest
 
-    context.settings.agent_framework = "custom"
+    context.settings.agent_framework = "event_driven_multi_agent"
     db = context.session()
     observed = []
     try:
@@ -370,21 +375,21 @@ def run_agent_routing_harness(context: HarnessContext) -> dict:
                 "id": "normal-companion",
                 "message": "帮我解释一下 Python list comprehension。",
                 "intent": IntentType.CHAT.value,
-                "must_steps": ["MemoryAgent", "SupervisorAgent", "CompanionAgent"],
-                "must_not_steps": ["KnowledgeAgent", "RiskGuardianAgent", "CounselorAgent"],
+                "must_steps": ["UnderstandingAgent", "SafetyAgent", "ResponseAgent", "CoordinatorAgent"],
+                "must_not_steps": ["ContextAgent"],
             },
             {
                 "id": "consult-counselor",
                 "message": "我最近压力很大，睡不着，白天也很焦虑。",
                 "intent": IntentType.CONSULT.value,
-                "must_steps": ["MemoryAgent", "SupervisorAgent", "KnowledgeAgent", "RiskGuardianAgent", "CounselorAgent"],
+                "must_steps": ["UnderstandingAgent", "SafetyAgent", "ContextAgent", "ResponseAgent", "CoordinatorAgent"],
             },
             {
                 "id": "risk-counselor",
                 "message": "我不想活了，觉得撑不下去了。",
                 "intent": IntentType.RISK.value,
                 "risk": RiskLevel.HIGH.value,
-                "must_steps": ["MemoryAgent", "SupervisorAgent", "KnowledgeAgent", "RiskGuardianAgent", "CounselorAgent"],
+                "must_steps": ["UnderstandingAgent", "SafetyAgent", "ContextAgent", "ResponseAgent", "CoordinatorAgent"],
             },
         ]
         for case in cases:
@@ -404,12 +409,32 @@ def run_agent_routing_harness(context: HarnessContext) -> dict:
                 expect(agent in step_agents, f"{case['id']} did not run {agent}")
             for agent in case.get("must_not_steps", []):
                 expect(agent not in step_agents, f"{case['id']} should not run {agent}")
+            actions = [step.action for step in result.agent_steps]
+            expect("FINAL_ACCEPTED" in actions, f"{case['id']} response was not accepted")
+            if case["id"] == "risk-counselor":
+                expect("SAFETY_OVERRIDE" in actions, "risk case did not publish SAFETY_OVERRIDE")
             if case["intent"] != IntentType.CHAT.value:
                 expect(len(result.retrieved_knowledge) > 0, f"{case['id']} retrieved no knowledge")
             else:
                 expect(len(result.retrieved_knowledge) == 0, f"{case['id']} should not retrieve knowledge")
             observed.append({"id": case["id"], "intent": result.intent.value, "risk": result.risk_level, "steps": step_agents})
+
+        # 回退链路保持同一 AgentRunResult/Harness 契约。
+        for framework in ["custom", "langgraph"]:
+            context.settings.agent_framework = framework
+            session = ChatSession(public_id=uuid.uuid4().hex, user_id=user.id, title=f"fallback-{framework}")
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            result = MindBridgeAgentHarness(db, context.settings).run(
+                user,
+                ChatRequest(message="帮我解释一下 Python 元组。", sessionId=session.public_id),
+            )
+            expect(result.intent == IntentType.CHAT, f"{framework} fallback did not preserve CHAT routing")
+            expect(bool(result.response_messages), f"{framework} fallback produced no response messages")
+            observed.append({"id": f"fallback-{framework}", "intent": result.intent.value})
     finally:
+        context.settings.agent_framework = "event_driven_multi_agent"
         db.close()
     return {"cases": observed}
 
@@ -444,7 +469,7 @@ def run_standard_skills_harness(context: HarnessContext) -> dict:
     statuses = MindBridgeSkillLibrary.status_items()
     failed = [item for item in statuses if item["status"] != "READY"]
     expect(not failed, f"standard skill load failures: {failed}")
-    expect(all(item["path"].endswith("/SKILL.md") for item in statuses), "skill status did not expose SKILL.md paths")
+    expect(all(Path(item["path"]).name == "SKILL.md" for item in statuses), "skill status did not expose SKILL.md paths")
 
     # 验证 CONSULT 意图的 Skill 选择
     selected_names = MindBridgeSkillLibrary.response_skill_names(
@@ -587,7 +612,15 @@ def run_api_harness(context: HarnessContext) -> dict:
         expect(agent_status.status_code == 200, f"agent status failed: {agent_status.status_code}")
         status_skills = agent_status.json()["skills"]
         expect(len(status_skills) >= 7, f"agent status exposed too few standard skills: {len(status_skills)}")
-        expect(all(skill["path"].endswith("/SKILL.md") for skill in status_skills), "agent status did not expose standard skill paths")
+        expect(all(Path(skill["path"]).name == "SKILL.md" for skill in status_skills), "agent status did not expose standard skill paths")
+        expect(
+            agent_status.json()["agentFramework"]["active"] == "event_driven_multi_agent",
+            "agent status did not expose event-driven runtime",
+        )
+        expect(
+            "not runtime-enforced" in agent_status.json()["collaboration"]["agentIsolation"]["tools"],
+            "agent status overstated tool_permissions enforcement",
+        )
 
         # 管理员禁止发起学生对话
         admin_chat = client.post("/api/chat/stream", headers=admin_auth, json={"message": "hello"})
@@ -605,6 +638,20 @@ def run_api_harness(context: HarnessContext) -> dict:
 
         admin_reports = client.get("/api/admin/reports", headers=admin_auth)
         expect(admin_reports.status_code == 200, f"admin reports failed: {admin_reports.status_code}")
+
+        admin_traces = client.get("/api/admin/agent-traces", headers=admin_auth)
+        expect(admin_traces.status_code == 200, f"admin agent traces failed: {admin_traces.status_code}")
+        expect(bool(admin_traces.json()), "admin agent traces returned no event-driven trace")
+        trace_steps = admin_traces.json()[0]["agentSteps"]
+        trace_kinds = {item.get("kind") for item in trace_steps if isinstance(item, dict)}
+        expect(
+            {"agent_event", "agent_task", "agent_artifact"}.issubset(trace_kinds),
+            f"event-driven trace omitted collaboration entries: {trace_kinds}",
+        )
+
+        admin_audits = client.get("/api/admin/tool-audits", headers=admin_auth)
+        expect(admin_audits.status_code == 200, f"admin tool audits failed: {admin_audits.status_code}")
+        expect(isinstance(admin_audits.json(), list), "admin tool audits did not return a list")
 
         # 知识库入库
         ingest = client.post(
@@ -639,7 +686,7 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
     - 死信记录生成
     """
     from app.core.enums import EmotionLabel, IntentType, RiskCaseStatus, RiskLevel, ToolJobKind, ToolJobStatus, ToolStatus
-    from app.models.entities import DeadLetterRecord, PsychologicalReport, ToolJob, ChatSession, UserAccount
+    from app.models.entities import DeadLetterRecord, PsychologicalReport, ToolAuditRecord, ToolJob, ChatSession, UserAccount
     from app.services.tool_queue import RateLimiter, ToolQueueService, ToolQueueWorker
     from app.services.tools import ToolOrchestrationService
 
@@ -676,6 +723,25 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         expect(alert_job.depends_on_job_id == case_job.id, "alert job does not depend on case creation job")
         expect(not worker._dependency_ready(db, alert_job), "alert dependency should not be ready before case creation success")
 
+        # 通过真实 Worker 路径执行三类任务，并验证每次都产生治理审计。
+        for job in [excel_job, case_job, alert_job]:
+            if job.kind == ToolJobKind.ALERT_SEND.value:
+                db.expire_all()
+                alert_job = db.get(ToolJob, alert_job.id)
+                expect(worker._dependency_ready(db, alert_job), "alert dependency was not ready after case worker success")
+                job = alert_job
+            job.status = ToolJobStatus.RUNNING.value
+            db.add(job)
+            db.commit()
+            worker._run_job(job.id)
+            db.expire_all()
+            finished = db.get(ToolJob, job.id)
+            expect(finished.status == ToolJobStatus.SUCCESS.value, f"worker did not complete {job.kind}")
+
+        audits = db.query(ToolAuditRecord).filter(ToolAuditRecord.report_id == report.id).all()
+        expect(len(audits) == 3, f"expected 3 tool audit records, got {len(audits)}")
+        expect(all(audit.allowed and audit.status == "SUCCESS" for audit in audits), "tool audits did not record successful authorization")
+
         # 验证幂等性
         tools = ToolOrchestrationService(db, context.settings)
         excel_record = tools.write_excel(report)
@@ -688,9 +754,8 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         expect(second_case_record.id == case_record.id, "case creation is not idempotent")
 
         # 验证依赖就绪
-        case_job.status = ToolJobStatus.SUCCESS.value
-        db.add(case_job)
-        db.commit()
+        db.expire_all()
+        alert_job = db.get(ToolJob, alert_job.id)
         expect(worker._dependency_ready(db, alert_job), "alert dependency was not ready after case creation success")
 
         # 验证预警发送
@@ -698,6 +763,41 @@ def run_tool_queue_harness(context: HarnessContext) -> dict:
         expect(alert_record.status == ToolStatus.SUCCESS.value, f"alert notify failed: {alert_record.message}")
         db.refresh(case_record)
         expect(case_record.status == RiskCaseStatus.ALERT_SENT.value, "case did not move to ALERT_SENT after alert")
+
+        # 不匹配的任务必须在治理层被拦截，不能执行工具。
+        low_report = PsychologicalReport(
+            user_id=user.id,
+            session_id=session.id,
+            content="普通低风险内容",
+            intent=IntentType.CONSULT.value,
+            emotion=EmotionLabel.NORMAL.value,
+            emotion_score=0.0,
+            risk_level=RiskLevel.LOW.value,
+            confidence=0.9,
+            summary="low risk governance case",
+        )
+        db.add(low_report)
+        db.commit()
+        db.refresh(low_report)
+        blocked_job = ToolJob(
+            report_id=low_report.id,
+            kind=ToolJobKind.CASE_CREATE.value,
+            status=ToolJobStatus.RUNNING.value,
+            attempts=0,
+            max_attempts=1,
+        )
+        db.add(blocked_job)
+        db.commit()
+        db.refresh(blocked_job)
+        worker._run_job(blocked_job.id)
+        blocked_audit = (
+            db.query(ToolAuditRecord)
+            .filter(ToolAuditRecord.job_id == blocked_job.id)
+            .order_by(ToolAuditRecord.id.desc())
+            .first()
+        )
+        expect(blocked_audit is not None, "blocked worker task produced no audit")
+        expect(not blocked_audit.allowed and blocked_audit.status == "BLOCKED", "governance did not block low-risk alert")
 
         # 验证限流器
         limiter = RateLimiter(1)

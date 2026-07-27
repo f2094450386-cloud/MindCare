@@ -9,8 +9,8 @@ Skill 是结构化的心理支持指引文档（Markdown 格式），
 - body: 具体指引内容（可包含 ```text 模板）
 
 Skill 选择逻辑（由 response_skill_names 决定）：
-- CHAT 意图 → 不选任何 skill
-- RISK 高风险 → supportive_response_baseline + high_risk_safety_plan
+- HIGH 风险（无论 Understanding 意图）→ supportive_response_baseline + high_risk_safety_plan
+- 非 HIGH 的 CHAT 意图 → 不选任何 skill
 - CONSULT 意图 → 根据关键词动态选择：
   - 基础：supportive_response_baseline + referral_resource_guidance
   - 焦虑相关 → + anxiety_grounding_support
@@ -24,7 +24,7 @@ Skill 选择逻辑（由 response_skill_names 决定）：
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.core.enums import IntentType, RiskLevel
@@ -37,16 +37,43 @@ class SkillLoadError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SkillValidationIssue:
+    """标准 Skill 的结构校验结果。"""
+
+    level: str
+    message: str
+
+
+@dataclass(frozen=True)
 class MindBridgeSkill:
     """Skill 数据对象。"""
     name: str
     description: str
     body: str
     path: Path
+    metadata: dict[str, str] = field(default_factory=dict)
 
     def prompt_context(self) -> str:
         """将 skill 内容格式化为 LLM prompt 上下文。"""
         return f"应用 skill: {self.name}\n{self.body.strip()}"
+
+    def validation_issues(self) -> list[SkillValidationIssue]:
+        """检查目录、frontmatter 描述、Workflow 和特殊模板约束。"""
+        issues: list[SkillValidationIssue] = []
+        if self.path.parent.name != self.name:
+            issues.append(
+                SkillValidationIssue(
+                    "WARN",
+                    f"目录名 {self.path.parent.name} 与 skill name {self.name} 不一致",
+                )
+            )
+        if "## Workflow" not in self.body:
+            issues.append(SkillValidationIssue("WARN", "建议包含 ## Workflow 小节，便于人工审阅和模型稳定加载"))
+        if len(self.description) < 20:
+            issues.append(SkillValidationIssue("WARN", "description 太短，可能无法准确表达触发场景"))
+        if self.name == "counselor_handoff_summary" and "```text" not in self.body:
+            issues.append(SkillValidationIssue("ERROR", "counselor_handoff_summary 必须包含 text 模板"))
+        return issues
 
 
 class MindBridgeSkillRegistry:
@@ -68,7 +95,7 @@ class MindBridgeSkillRegistry:
             skills.append(self._load_skill_file(skill_file))
         return skills
 
-    def status_items(self) -> list[dict[str, str]]:
+    def status_items(self) -> list[dict]:
         """返回所有 skill 的状态信息（用于 /api/agent/status）。"""
         if not self.root.exists():
             return []
@@ -76,6 +103,7 @@ class MindBridgeSkillRegistry:
         for skill_file in sorted(self.root.glob("*/SKILL.md")):
             try:
                 skill = self._load_skill_file(skill_file)
+                issues = skill.validation_issues()
             except SkillLoadError as exc:
                 items.append(
                     {
@@ -83,15 +111,19 @@ class MindBridgeSkillRegistry:
                         "status": "FAILED",
                         "description": str(exc),
                         "path": str(skill_file.relative_to(self.root.parent)),
+                        "issues": [{"level": "ERROR", "message": str(exc)}],
                     }
                 )
                 continue
+            has_error = any(issue.level == "ERROR" for issue in issues)
             items.append(
                 {
                     "name": skill.name,
-                    "status": "READY",
+                    "status": "FAILED" if has_error else "READY" if not issues else "WARN",
                     "description": skill.description,
                     "path": str(skill.path.relative_to(self.root.parent)),
+                    "issues": [{"level": issue.level, "message": issue.message} for issue in issues],
+                    "metadata": skill.metadata,
                 }
             )
         return items
@@ -128,7 +160,13 @@ class MindBridgeSkillRegistry:
             raise SkillLoadError(f"{path} is missing frontmatter description")
         if not body.strip():
             raise SkillLoadError(f"{path} is missing skill body")
-        return MindBridgeSkill(name=name.strip(), description=description.strip(), body=body.strip(), path=path)
+        return MindBridgeSkill(
+            name=name.strip(),
+            description=description.strip(),
+            body=body.strip(),
+            path=path,
+            metadata=metadata,
+        )
 
 
 class MindBridgeSkillLibrary:
@@ -147,7 +185,7 @@ class MindBridgeSkillLibrary:
         return MindBridgeSkillLibrary.registry().list_skills()
 
     @staticmethod
-    def status_items() -> list[dict[str, str]]:
+    def status_items() -> list[dict]:
         return MindBridgeSkillLibrary.registry().status_items()
 
     @staticmethod
@@ -168,15 +206,15 @@ class MindBridgeSkillLibrary:
         根据意图、风险等级和文本内容选择需要的 skill。
 
         选择逻辑：
-        - CHAT → 空列表
-        - RISK HIGH → supportive_response_baseline + high_risk_safety_plan
+        - HIGH risk → supportive_response_baseline + high_risk_safety_plan
+        - non-HIGH CHAT → 空列表
         - CONSULT → 根据关键词动态组合
         """
-        if intent == IntentType.CHAT:
-            return []
-
         if risk == RiskLevel.HIGH:
             return ["supportive_response_baseline", "high_risk_safety_plan"]
+
+        if intent == IntentType.CHAT:
+            return []
 
         lowered = text.lower()
         names = ["supportive_response_baseline", "referral_resource_guidance"]

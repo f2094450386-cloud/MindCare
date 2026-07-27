@@ -30,6 +30,7 @@ Agent 执行顺序（每轮对话固定）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -106,6 +107,9 @@ class AgentRunResult:
     response_messages: list[AiMessage]
     steps: list[AgentStep]
     memory_brief: str    # 记忆摘要，供 harness 落库 AgentRunTrace 使用
+    collaboration_events: list[Any] = field(default_factory=list)
+    collaboration_tasks: list[Any] = field(default_factory=list)
+    collaboration_artifacts: list[Any] = field(default_factory=list)
 
     @property
     def requires_report(self) -> bool:

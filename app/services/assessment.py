@@ -2,7 +2,7 @@
 MindBridge 心理风险评估模块
 
 实现三级防线的风险评估策略：
-1. 高风险词典硬兜底：文本包含"自杀""不想活"等关键词 → 直接判定 HIGH_RISK
+1. 高风险规则硬兜底：结合局部主体、否定和引用语境确认当前风险 → 判定 HIGH_RISK
 2. LLM JSON 评估：通过 prompt 让模型输出结构化评估结果
 3. 关键词启发式兜底：LLM 调用失败时，基于咨询关键词做简单分类
 
@@ -25,7 +25,13 @@ from dataclasses import dataclass
 
 from app.core.enums import EmotionLabel, RiskLevel
 from app.schemas.dtos import AiMessage
-from app.services.ai import AiClient, PromptTemplates, has_consult_signal, has_high_risk_signal
+from app.services.ai import (
+    AiClient,
+    PromptTemplates,
+    has_consult_signal,
+    has_high_risk_signal,
+    has_medium_risk_signal,
+)
 
 
 @dataclass
@@ -43,7 +49,7 @@ class PsychologicalAssessmentService:
     心理评估服务。
 
     调用 AiClient 进行 LLM 评估，包含三层防御：
-    1. 高风险词典快速拦截
+    1. 高风险规则快速拦截
     2. LLM JSON 结构化评估
     3. 关键词启发式兜底
     """
@@ -56,16 +62,24 @@ class PsychologicalAssessmentService:
         执行心理风险评估。
 
         流程：
-        1. 检查高风险关键词 → 命中则直接返回 HIGH_RISK
+        1. 检查经局部语境确认的高风险表达 → 命中则直接返回 HIGH_RISK
         2. 调用 LLM psychology_prompt 获取 JSON 评估
         3. 解析 JSON，校验字段
         4. 如果情绪分数推算的风险等级更高，取更高的
         5. HIGH_RISK 情绪强制设为 HIGH 风险
         6. LLM 调用失败 → 降级到关键词启发式
         """
-        # 第一道防线：高风险词典硬兜底
+        # 第一道防线：带主体、否定和引用语境判断的高风险硬兜底
         if has_high_risk_signal(text):
             return PsychologyAssessment(EmotionLabel.HIGH_RISK, 4.0, RiskLevel.HIGH, 0.95, "检测到明确高风险表达")
+        if has_medium_risk_signal(text):
+            return PsychologyAssessment(
+                EmotionLabel.DEPRESSED,
+                3.2,
+                RiskLevel.MEDIUM,
+                0.84,
+                "检测到持续或明显影响功能的风险信号",
+            )
 
         try:
             # 第二道防线：LLM JSON 评估

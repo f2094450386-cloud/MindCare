@@ -26,6 +26,7 @@ from app.api.routes import router
 from app.core.bootstrap import create_schema, seed_data
 from app.core.config import get_settings
 from app.core.database import SessionLocal
+from app.core.version import get_app_version
 from app.services.tool_queue import get_tool_queue_worker
 
 
@@ -34,8 +35,10 @@ def create_app() -> FastAPI:
     创建 FastAPI 应用实例。
 
     包含所有中间件、事件处理器和路由注册。
+    版本号来自 VERSION / APP_VERSION，避免硬编码漂移。
     """
-    app = FastAPI(title="MindBridge Python", version="0.1.0")
+    settings = get_settings()
+    app = FastAPI(title="MindBridge Python", version=get_app_version(settings.app_version))
 
     # ── HTTP 中间件：前端资源禁用缓存 ──────────────────────────────
     # 开发阶段确保每次请求都获取最新的前端资源

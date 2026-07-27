@@ -108,12 +108,11 @@ def agent_status(user: Annotated[UserAccount, Depends(current_user)]):
         "agentFramework": framework,
         "finetunedModel": finetuned_model_status(settings),
         "agents": [
-            {"name": "MemoryAgent", "status": "READY", "description": "短期上下文与长期记忆摘要"},
-            {"name": "SupervisorAgent", "status": "READY", "description": "意图识别与路由"},
-            {"name": "KnowledgeAgent", "status": "READY", "description": "RAG 检索与证据补充"},
-            {"name": "RiskGuardianAgent", "status": "READY", "description": "心理风险识别与分级"},
-            {"name": "CompanionAgent", "status": "READY", "description": "普通陪伴式回复"},
-            {"name": "CounselorAgent", "status": "READY", "description": "咨询式支持回复"},
+            {"name": "CoordinatorAgent", "status": "READY", "description": "维护任务板、预算、安全门槛和最终采纳"},
+            {"name": "UnderstandingAgent", "status": "READY", "description": "发布 intent artifact"},
+            {"name": "SafetyAgent", "status": "READY", "description": "独立风险评估和候选回复安全审查"},
+            {"name": "ContextAgent", "status": "READY", "description": "聚合记忆、RAG 和 Skill 上下文"},
+            {"name": "ResponseAgent", "status": "READY", "description": "发布候选回复 messages 和策略 artifact"},
         ],
         "skills": MindBridgeSkillLibrary.status_items(),
         "runtimeHarness": {
@@ -122,9 +121,30 @@ def agent_status(user: Annotated[UserAccount, Depends(current_user)]):
             "description": "统一管理单轮 Agent run 的输入脱敏、上下文注入、风险报告、工具计划和 trace 输出",
         },
         "loop": {
-            "type": "bounded-agent-loop",
+            "type": "event-driven-multi-agent" if framework["active"] == "event_driven_multi_agent" else "bounded-agent-loop",
             "maxSteps": AgentRuntimeService.max_steps,
-            "scheduler": "langgraph-controller" if framework["active"] == "langgraph" else "custom-runtime",
+            "maxRounds": settings.agent_max_rounds,
+            "maxClaimsPerRound": settings.agent_max_claims_per_round,
+            "maxClaimsPerAgent": settings.agent_max_claims_per_agent,
+            "scheduler": (
+                "claim-based-coordinator"
+                if framework["active"] == "event_driven_multi_agent"
+                else "langgraph-controller"
+                if framework["active"] == "langgraph"
+                else "custom-runtime"
+            ),
+        },
+        "collaboration": {
+            "state": "append-only-through-blackboard-methods",
+            "messages": "trace-and-explanation-only; workers do not consume inbox messages",
+            "dynamicScheduling": framework["active"] == "event_driven_multi_agent",
+            "execution": "single-process-synchronous",
+            "agentIsolation": {
+                "prompt": "per-agent system prompt",
+                "memory": "per-agent private Redis key",
+                "model": "per-agent model profile",
+                "tools": "AgentProfile metadata only; not runtime-enforced",
+            },
         },
     }
 

@@ -4,7 +4,7 @@
 
 - 学生端 SSE 流式聊天，前端可展示打字机式输出。
 - Basic Auth 登录，支持学生和管理员角色隔离。
-- LangGraph 多 Agent 工作流：Memory、Supervisor、Knowledge、RiskGuardian、Companion、Counselor，未安装 LangGraph 时自动回退到自研有限循环 runtime。
+- 事件协议驱动多 Agent 控制层：Coordinator 通过 Blackboard、任务认领和 artifact 协调 Understanding、Safety、Context、Response；同时保留 LangGraph 和 custom 有限循环回退。
 - 动态路由 RAG：先判断 `CHAT / CONSULT / RISK`，普通问题不查知识库，咨询和风险场景才进入检索增强。
 - Chroma 向量 RAG 知识库：支持 Markdown、txt、PDF 文件上传，自动切块，使用 `text-embedding-3-small` 写入向量库，并与 BM25 关键词召回融合后进入本地 reranker；向量不可用时保留本地 BM25 + 词面检索兜底。
 - 心理风险评估：高风险词典优先、LLM JSON 评估、关键词兜底。
@@ -25,7 +25,7 @@ Web 框架：FastAPI
 短期记忆：Redis
 配置管理：pydantic-settings，.env
 AI 接入：Ollama，本地微调 GGUF 模型，OpenAI-compatible API，Mock Provider
-Agent 编排：LangGraph，多 Agent 图工作流，自研 runtime 兜底
+Agent 编排：默认 event-driven Blackboard 有限协作循环，LangGraph/custom runtime 兼容回退
 RAG：本地知识库切块、OpenAI Embeddings、Chroma 向量库、BM25、分数融合、本地 reranker、上下文扩展
 流式输出：Server-Sent Events
 文档解析：pypdf
@@ -36,13 +36,13 @@ Excel 台账：openpyxl
 工具协议：MCP
 ```
 
-说明：当前 Python 版已经提供 LangGraph runtime，入口在 `app/agents/langgraph_runtime.py`；同时保留 `app/agents/runtime.py` 作为无框架兜底。RAG 默认使用 Chroma 本地持久化向量库做语义召回，同时用 BM25 做关键词召回，再融合并本地 rerank；未安装 Chroma、未配置 `OPENAI_API_KEY` 或向量服务异常时，会自动回退到本地 BM25 + `hybrid_score` reranker
+说明：默认入口是 `app/agents/event_driven_runtime.py`；`app/agents/langgraph_runtime.py` 和 `app/agents/runtime.py` 分别保留 LangGraph/custom 回退。三套 Runtime 都返回统一 `AgentRunResult`，因此 Harness、SSE、报告与工具链无需理解内部调度方式。RAG 默认使用 Chroma 本地持久化向量库做语义召回，同时用 BM25 做关键词召回，再融合并本地 rerank；未安装 Chroma、未配置 `OPENAI_API_KEY` 或向量服务异常时，会自动回退到本地 BM25 + `hybrid_score` reranker。
 
 ## 目录结构
 
 ```text
 app/
-├── agents/          # LangGraph 多 Agent 编排和自研 runtime 兜底
+├── agents/          # Event-driven、LangGraph 和 custom 三套 Agent Runtime
 ├── api/             # FastAPI 路由
 ├── core/            # 配置、数据库、安全、启动初始化
 ├── knowledge/       # 内置校园心理知识库
@@ -66,25 +66,32 @@ scripts/
 
 ## Agent loop
 
-每轮对话进入一个 LangGraph 多 Agent 工作流，防止心理安全场景出现无限自主循环：
+默认 Runtime 使用单进程同步、预算受限的事件协作循环，不实现无限自主循环，也不宣称 Agent 并行执行：
 
 ```text
-MemoryAgent
--> SupervisorAgent
--> KnowledgeAgent
--> RiskGuardianAgent
--> CompanionAgent / CounselorAgent
--> SSE 流式输出
+CoordinatorAgent
+    → 派生 task 并维护轮次/认领预算
+    → UnderstandingAgent 发布 intent artifact
+    → SafetyAgent 独立发布 risk artifact / SAFETY_OVERRIDE
+    → ContextAgent 按需聚合 Memory、RAG 与 Skill context
+    → ResponseAgent 发布 response_proposal
+    → SafetyAgent 发布 safety_review 或 critique
+    → CoordinatorAgent FINAL_ACCEPTED，或预算耗尽使用安全 fallback
 ```
 
-各 Agent 分工：
+协作状态保存在一次 turn 的 `CollaborationBlackboard` 中，包含 task、message、artifact 和 event。message 当前主要用于 trace 与解释性记录，worker 尚不依靠 inbox 消息驱动决策。每个 Agent 具有独立 system prompt、私有 Redis key 和模型配置入口；`AgentProfile.tool_permissions` 目前只是元数据，不是运行时强制权限系统。
 
-- `MemoryAgent`：优先从 Redis 读取本会话短期记忆；Redis 为空时从 MySQL 最近消息回填，并生成本轮记忆摘要。
-- `SupervisorAgent`：判断 `CHAT / CONSULT / RISK`，决定是否进入心理支持链路。
-- `KnowledgeAgent`：将学生输入改写为知识库查询词，执行 RAG 检索。
-- `RiskGuardianAgent`：执行后台心理状态评估，同时保留高风险词库硬兜底。
-- `CompanionAgent`：处理普通学习、编程、校园事务和闲聊。
-- `CounselorAgent`：结合记忆、RAG 和风险评估，生成心理支持回复 prompt。
+可通过环境变量切换 Runtime：
+
+```env
+AGENT_FRAMEWORK=event_driven_multi_agent
+AGENT_MAX_ROUNDS=8
+AGENT_MAX_CLAIMS_PER_ROUND=4
+AGENT_MAX_CLAIMS_PER_AGENT=3
+AGENT_FINAL_ACCEPTANCE_MIN_CONFIDENCE=0.6
+```
+
+`AGENT_FRAMEWORK=langgraph` 使用旧 LangGraph controller loop；`AGENT_FRAMEWORK=custom` 使用自研固定有限循环，便于快速回退。
 
 ## 安装依赖
 
@@ -268,6 +275,7 @@ curl -u student:student123 http://127.0.0.1:8080/api/agent/status
 同时 `agentFramework.active` 会显示当前实际使用的 Agent 编排框架：
 
 ```text
+event_driven_multi_agent
 langgraph
 custom
 ```
@@ -349,10 +357,10 @@ target/rag-eval-report.json
 
 ## Agent Runtime Harness
 
-线上对话通过 `MindBridgeAgentHarness` 组织一次 Agent run。Harness 不改变 LangGraph / custom runtime 内部的多 Agent 协作顺序，而是在外层统一管理：
+线上对话通过 `MindBridgeAgentHarness` 组织一次 Agent run。Harness 不理解 event-driven / LangGraph / custom 的内部调度，只在外层统一管理：
 
 - 输入脱敏和 session 解析。
-- Memory / Supervisor / Knowledge / RiskGuardian / Response Agent 调用。
+- Runtime 选择与统一 `AgentRunResult` 适配。
 - 心理报告落库和工具计划生成。
 - 学生与助手消息持久化。
 - Agent steps、知识召回、风险结果等 trace 数据输出。
@@ -364,11 +372,11 @@ target/rag-eval-report.json
 项目提供一键工程 harness，用 mock AI、临时 SQLite、内存短期记忆和本地输出验证核心链路：
 
 - Risk Safety Harness：高风险识别、报告生成、后台元数据不外显、工具队列入队。
-- Agent Routing Harness：通过 `MindBridgeAgentHarness` 验证 CHAT / CONSULT / RISK 路由和多 Agent 步骤。
+- Agent Routing Harness：默认运行真正的 event-driven Runtime，验证 CHAT / CONSULT / RISK、安全审查、RAG/Skill 与 `custom/langgraph` 回退。
 - Standard Skills Harness：验证 `skills/*/SKILL.md` 标准 Skill 加载、选择逻辑和交接摘要模板渲染。
 - RAG Harness：基于内置评测集验证 Recall@K、MRR、NDCG 和 HitRate。
 - API Harness：健康检查、认证授权、SSE 聊天、管理员知识库接口。
-- Tool Queue Harness：Excel / case / alert 依赖、幂等、限流和 dead letter。
+- Tool Queue Harness：Excel / case / alert 依赖、幂等、限流、dead letter，以及每次 Worker 执行的 ToolAuditRecord。
 
 ```bash
 python3 -m app.harness.runner
