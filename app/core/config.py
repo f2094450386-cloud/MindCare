@@ -29,9 +29,43 @@ class Settings(BaseSettings):
     """
 
     # ── Agent 编排框架 ──────────────────────────────────────────────
+    # "event_driven_multi_agent" = Blackboard + task/artifact 驱动的默认主链路
     # "langgraph" = 使用 LangGraph 构建多 Agent 有向图（需要安装 langgraph）
     # "custom"    = 使用自研有限循环 runtime（无外部依赖兜底方案）
-    agent_framework: str = "langgraph"
+    agent_framework: str = "event_driven_multi_agent"
+    agent_max_rounds: int = 8
+    agent_max_claims_per_round: int = 4
+    agent_max_claims_per_agent: int = 3
+    agent_final_acceptance_min_confidence: float = 0.6
+    app_version: str = ""
+
+    # 每个 Agent 可独立覆盖 provider/model；空值继承全局 AI 配置
+    agent_model_default_provider: str = ""
+    agent_model_default_model: str = ""
+    agent_model_coordinator_provider: str = ""
+    agent_model_coordinator_model: str = ""
+    agent_model_understanding_provider: str = ""
+    agent_model_understanding_model: str = ""
+    agent_model_safety_provider: str = ""
+    agent_model_safety_model: str = ""
+    agent_model_context_provider: str = ""
+    agent_model_context_model: str = ""
+    agent_model_response_provider: str = ""
+    agent_model_response_model: str = ""
+
+    # 旧角色和后续扩展别名
+    agent_model_intent_provider: str = ""
+    agent_model_intent_model: str = ""
+    agent_model_risk_provider: str = ""
+    agent_model_risk_model: str = ""
+    agent_model_knowledge_provider: str = ""
+    agent_model_knowledge_model: str = ""
+    agent_model_companion_provider: str = ""
+    agent_model_companion_model: str = ""
+    agent_model_counselor_provider: str = ""
+    agent_model_counselor_model: str = ""
+    agent_model_safety_critic_provider: str = ""
+    agent_model_safety_critic_model: str = ""
 
     # ── AI 模型配置 ────────────────────────────────────────────────
     # ai_provider: "ollama" / "openai" / "mock"
@@ -94,6 +128,13 @@ class Settings(BaseSettings):
     rag_eval_output: str = "target/rag-eval-report.json"
     rag_eval_enabled: bool = False
     rag_eval_exit_after_run: bool = False
+
+    # ── 路由 / Memory 评测配置（P0 证据）──────────────────────────
+    # 报告会绑定 VERSION + git fingerprint + 数据集 sha256，便于简历复现。
+    route_eval_dataset: str = "datasets/route_eval.jsonl"
+    route_eval_output: str = "target/eval/route-eval-report.json"
+    memory_eval_dataset: str = "datasets/memory_compression_eval.json"
+    memory_eval_output: str = "target/eval/memory-eval-report.json"
 
     # ── Excel 台账配置 ────────────────────────────────────────────
     excel_path: str = "data/mindbridge-risk-ledger.xlsx"

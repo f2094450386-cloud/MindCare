@@ -57,7 +57,7 @@ class AgentTraceService:
             original_input=original_input,
             sanitized_input=sanitized_input,
             memory_brief=memory_brief,
-            agent_steps_json=_json(agent_run.steps),
+            agent_steps_json=_json(_agent_steps_with_collaboration(agent_run)),
             retrieved_knowledge_json=_json(agent_run.retrieved_knowledge),
             response_messages_json=_json(agent_run.response_messages),
             assessment_json=_json(agent_run.assessment or {}),
@@ -71,6 +71,51 @@ class AgentTraceService:
 def _json(value: Any) -> str:
     """将任意值序列化为 JSON 字符串（含 dataclass/Enum/pydantic 模型的兼容处理）。"""
     return json.dumps(_to_jsonable(value), ensure_ascii=False, default=str)
+
+
+def _agent_steps_with_collaboration(agent_run: AgentRunResult) -> list[Any]:
+    """在旧 AgentStep 后追加事件、任务和 artifact，保持查询契约兼容。"""
+    entries: list[Any] = [*agent_run.steps]
+    entries.extend(
+        {
+            "kind": "agent_event",
+            "type": getattr(event.type, "value", event.type),
+            "actor": event.actor,
+            "taskId": event.task_id,
+            "artifactId": event.artifact_id,
+            "message": event.message,
+            "metadata": event.metadata,
+        }
+        for event in agent_run.collaboration_events
+    )
+    entries.extend(
+        {
+            "kind": "agent_task",
+            "id": task.id,
+            "title": task.title,
+            "status": getattr(task.status, "value", task.status),
+            "priority": getattr(task.priority, "value", task.priority),
+            "requiredCapabilities": sorted(task.required_capabilities),
+            "claimedBy": list(task.claimed_by),
+            "createdBy": task.created_by,
+            "metadata": task.metadata,
+        }
+        for task in agent_run.collaboration_tasks
+    )
+    entries.extend(
+        {
+            "kind": "agent_artifact",
+            "id": artifact.id,
+            "owner": artifact.owner,
+            "artifactKind": artifact.kind,
+            "confidence": artifact.confidence,
+            "taskId": artifact.task_id,
+            "metadata": artifact.metadata,
+            "payload": artifact.payload,
+        }
+        for artifact in agent_run.collaboration_artifacts
+    )
+    return entries
 
 
 def _to_jsonable(value: Any) -> Any:

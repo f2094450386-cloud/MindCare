@@ -254,9 +254,11 @@ class ToolQueueWorker:
             governance = ToolGovernanceService(db)
             audit = governance.start_job(job, report)
             try:
+                governance.require_allowed(job, report)
                 self._execute(db, job)
             except Exception as exc:
-                governance.finish(audit, "FAILED", reason=str(exc))
+                if audit.allowed:
+                    governance.finish(audit, "FAILED", reason=str(exc))
                 raise
             governance.finish(audit, "SUCCESS")
             job.status = ToolJobStatus.SUCCESS.value

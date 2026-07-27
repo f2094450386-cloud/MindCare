@@ -2,6 +2,7 @@
 MindBridge Agent 运行时工厂模块
 
 根据配置选择 Agent 运行时实现：
+- agent_framework="event_driven_multi_agent" → EventDrivenAgentRuntimeService
 - agent_framework="langgraph" 且 langgraph 已安装 → LangGraphAgentRuntimeService
 - 否则 → AgentRuntimeService（自研有限循环 runtime）
 
@@ -11,23 +12,32 @@ LangGraph 实现使用有向图编排多 Agent，支持条件分支。
 from __future__ import annotations
 
 from importlib.util import find_spec
+from typing import TYPE_CHECKING
 
-from sqlalchemy.orm import Session
-
-from app.agents.runtime import AgentRuntimeService
 from app.core.config import Settings
 
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
-def create_agent_runtime(db: Session, settings: Settings) -> AgentRuntimeService:
+    from app.agents.runtime import AgentRuntimeService
+
+
+def create_agent_runtime(db: "Session", settings: Settings) -> "AgentRuntimeService":
     """
     创建 Agent 运行时实例。
 
-    优先使用 LangGraph，不可用时回退到自研 runtime。
+    默认使用事件驱动多 Agent Runtime，并保留 LangGraph/custom 回退。
     """
+    if wants_event_driven(settings):
+        from app.agents.event_driven_runtime import EventDrivenAgentRuntimeService
+
+        return EventDrivenAgentRuntimeService(db, settings)
     if wants_langgraph(settings) and langgraph_available():
         from app.agents.langgraph_runtime import LangGraphAgentRuntimeService
 
         return LangGraphAgentRuntimeService(db, settings)
+    from app.agents.runtime import AgentRuntimeService
+
     return AgentRuntimeService(db, settings)
 
 
@@ -39,13 +49,24 @@ def agent_framework_status(settings: Settings) -> dict:
     """
     requested = settings.agent_framework.lower()
     available = langgraph_available()
-    active = "langgraph" if requested == "langgraph" and available else "custom"
+    if wants_event_driven(settings):
+        active = "event_driven_multi_agent"
+    elif requested == "langgraph" and available:
+        active = "langgraph"
+    else:
+        active = "custom"
+    requested_active = "event_driven_multi_agent" if wants_event_driven(settings) else requested
     return {
         "requested": requested,
         "active": active,
         "langgraphAvailable": available,
-        "fallback": active != requested,
+        "fallback": active != requested_active,
     }
+
+
+def wants_event_driven(settings: Settings) -> bool:
+    """检查配置是否请求事件驱动多 Agent Runtime。"""
+    return settings.agent_framework.lower() in {"event_driven_multi_agent", "multi_agent", "actors"}
 
 
 def wants_langgraph(settings: Settings) -> bool:
