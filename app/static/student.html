@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MindBridge 学生端</title>
-  <link rel="stylesheet" href="/styles.css?v=role-split-20260617">
+  <link rel="stylesheet" href="/styles.css?v=autumn-history-20260919">
 </head>
 <body class="student-page">
   <header class="topbar">
@@ -28,6 +28,15 @@
 
   <main class="student-layout">
     <aside class="student-rail">
+      <section class="panel history-panel" aria-labelledby="historyTitle">
+        <div class="history-head">
+          <h3 id="historyTitle">以前的对话</h3>
+          <button id="refreshHistory" class="ghost" type="button">刷新</button>
+        </div>
+        <p id="historyState" class="history-state" aria-live="polite">正在读取...</p>
+        <div id="historyList" class="history-list" aria-live="polite" aria-busy="true"></div>
+      </section>
+
       <section class="panel">
         <p class="panel-label">QUICK SIGNAL</p>
         <button class="signal" type="button" data-quick="我最近压力很大，晚上总是睡不着。">压力失眠</button>
@@ -72,6 +81,6 @@
     </section>
   </main>
 
-  <script src="/student.js?v=role-split-20260617"></script>
+  <script src="/student.js?v=autumn-history-20260919"></script>
 </body>
 </html>

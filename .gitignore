@@ -23,3 +23,7 @@ dist/
 .DS_Store
 __MACOSX/
 docs/mindbridge-interview-script.md
+# Local historical materials and browser inspection artifacts
+docs/archive/
+output/
+.playwright-cli/

@@ -17,10 +17,11 @@ MindBridge 报告查询服务模块
 """
 from __future__ import annotations
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.entities import AlertRecord, AgentRunTrace, CaseNote, ChatMessage, ChatSession, DeadLetterRecord, ExcelRecord, PsychologicalReport, RiskCase, ToolAuditRecord, ToolJob, UserAccount
-from app.schemas.dtos import AgentRunTraceResponse, CaseNoteResponse, ConversationMessageResponse, ConversationResponse, DeadLetterResponse, ReportResponse, RiskCaseResponse, ToolAuditResponse, ToolJobResponse, ToolRecordResponse
+from app.schemas.dtos import AgentRunTraceResponse, CaseNoteResponse, ChatSessionSummaryResponse, ConversationMessageResponse, ConversationResponse, DeadLetterResponse, ReportResponse, RiskCaseResponse, ToolAuditResponse, ToolJobResponse, ToolRecordResponse
 
 
 class ReportService:
@@ -181,7 +182,47 @@ class ReportService:
         session = self.db.query(ChatSession).filter(ChatSession.public_id == public_id).first()
         if session is None:
             raise ValueError("Session not found")
-        rows = self.db.query(ChatMessage).filter(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.asc()).all()
+        return self._conversation_response(session)
+
+    def student_sessions(self, user_id: int) -> list[ChatSessionSummaryResponse]:
+        """只列出该学生最近的 100 个会话，保留没有消息的会话。"""
+        rows = (
+            self.db.query(ChatSession, func.count(ChatMessage.id))
+            .outerjoin(ChatMessage, ChatMessage.session_id == ChatSession.id)
+            .filter(ChatSession.user_id == user_id)
+            .group_by(ChatSession.id)
+            .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+            .limit(100)
+            .all()
+        )
+        return [
+            ChatSessionSummaryResponse(
+                sessionId=session.public_id,
+                title=session.title,
+                messageCount=message_count,
+                createdAt=session.created_at,
+                updatedAt=session.updated_at,
+            )
+            for session, message_count in rows
+        ]
+
+    def student_conversation(self, public_id: str, user_id: int) -> ConversationResponse:
+        session = (
+            self.db.query(ChatSession)
+            .filter(ChatSession.public_id == public_id, ChatSession.user_id == user_id)
+            .first()
+        )
+        if session is None:
+            raise ValueError("Session not found")
+        return self._conversation_response(session)
+
+    def _conversation_response(self, session: ChatSession) -> ConversationResponse:
+        rows = (
+            self.db.query(ChatMessage)
+            .filter(ChatMessage.session_id == session.id)
+            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            .all()
+        )
         return ConversationResponse(
             sessionId=session.public_id,
             title=session.title,

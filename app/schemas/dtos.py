@@ -95,6 +95,15 @@ class ConversationResponse(BaseModel):
     messages: list[ConversationMessageResponse]
 
 
+class ChatSessionSummaryResponse(BaseModel):
+    """学生自己的历史会话列表项。"""
+    sessionId: str
+    title: str
+    messageCount: int
+    createdAt: datetime
+    updatedAt: datetime
+
+
 class ToolRecordResponse(BaseModel):
     """
     工具记录响应（Excel/Alert 通用）。

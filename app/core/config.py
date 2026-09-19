@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
 
+    # 秋招补充：独立离线评测配置，不改变线上 Agent 和生成模型配置。
+    judge_base_url: str = "https://api.openai.com/v1"
+    judge_api_key: str = ""
+    judge_model: str = "gpt-4o-mini"
+    judge_temperature: float = 0.0
+    judge_timeout_seconds: float = 90.0
+    answer_eval_dataset: str = "app/evaluation/mindbridge-response-eval.jsonl"
+    answer_eval_output: str = "target/answer-quality-eval-report.json"
+    agent_eval_output: str = "target/multi-agent-comparison-report.json"
+
     # ── 数据库配置 ─────────────────────────────────────────────────
     # 默认 MySQL；harness 测试时会切换为 SQLite
     database_url: str = "mysql+pymysql://mindbridge:mindbridge@127.0.0.1:3306/mindbridge?charset=utf8mb4"

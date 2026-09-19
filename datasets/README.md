@@ -14,9 +14,17 @@ It is small enough to keep in the repository and can be used to explain or repro
 - `route_eval.jsonl`：Understanding 意图、LOW/MEDIUM/HIGH 安全响应等级、最终安全路由评测（含 dev/holdout）。
   生成：`python scripts/build_route_eval_dataset.py`
   运行：`python -m app.route_eval.runner`；可用 `--split dev` / `--split holdout`，默认 gate 失败返回非零，`--no-gate` 仅生成报告。
+- `route_standard_eval.jsonl`：冻结的100条标准集，使用一般用户常见的单轮、直接话术；CHAT/CONSULT/RISK为40/36/24，LOW/MEDIUM/HIGH为60/16/24，dev/holdout各50条。它采用分层覆盖以保证各类指标有足够 support，不代表线上类别的自然占比。
+  生成：`python scripts/build_route_standard_dataset.py`
+  运行：`python -m app.route_eval.runner --dataset datasets/route_standard_eval.jsonl --output target/eval/route-standard-eval-report.json --no-gate`。标准集作为主要指标集，首次评测后不得依据得分反向改写样本；修订时升级 policy/source 版本并保留旧文件。
+- `route_challenge_eval.jsonl`：与发布回归集分离的冻结诊断集，共60条；CHAT/CONSULT/RISK各20条，LOW/MEDIUM/HIGH为28/10/22，dev/holdout各30条。它增加引用、元语言、否定、功能受损、隐晦风险和失败解除等边界，用于暴露泛化缺口，不以调节目标分数为目的，也不代表线上真实分布。
+  生成：`python scripts/build_route_challenge_dataset.py`
+  运行：`python -m app.route_eval.runner --dataset datasets/route_challenge_eval.jsonl --output target/eval/route-challenge-eval-report.json --no-gate`。首次冻结评测后不得依据得分反向改标签或措辞；若需修订，必须升级 policy/source 版本并保留旧文件。
 - `memory_compression_eval.json`：长对话压缩对照（46 条 dev + 38 条独立 paraphrase/robustness holdout）。
   生成：`python scripts/build_memory_eval_dataset.py`
   运行：`AI_PROVIDER=mock python -m app.memory_eval.runner`；可用 `--split dev` / `--split holdout` 单独执行并应用相同 gate。
+
+三套 Route 数据可一键运行：`python -m app.route_eval.suite_runner`。命令共执行336条用例，分别写出 regression、standard、challenge 完整报告，并生成 `target/eval/route-suite-report.json` 合并摘要。合并只统一执行和展示；standard 是主指标、regression 是发布门禁、challenge 是诊断结果，不计算跨套混合准确率。
 
 评测报告默认写到 `target/eval/`，all 保持配置的基础文件名，dev/holdout 自动追加 `-dev` / `-holdout`，因此顺序运行三个 split 不会互相覆盖：`route-eval-report.json`、`route-eval-report-dev.json`、`route-eval-report-holdout.json`，以及对应的 `memory-eval-report*.json`。显式 `--output` 始终原样使用。每份报告绑定应用版本、可验证 git 工作树指纹、规则源码 hash、配置快照与数据集 SHA-256。
 
@@ -51,10 +59,13 @@ It is small enough to keep in the repository and can be used to explain or repro
 - 线上确定性摘要从 `redis_memory_max_messages` 限定后的完整可见历史生成候选：除纯问题、简短确认/寒暄外，用户陈述默认进入候选，kind 只负责排序和更新策略，不再作为准入词表。`current_input` 的语义领域与词面特征参与预算选择；安全事实和当前请求相关事实优先。
 - 事实更新使用具体属性成员 slot 与独立 replacement scope，而不是把宽泛 domain 当作单一 replace slot；只有同一明确属性发生纠正、否定或替换时才淘汰旧值。入睡困难与早醒、跑步与游泳、考研与实习、文字与视频等可并存成员都会同时保留；带“只想/只能/统一用/全部改为”等排他范围的陈述才重置整个集合，省略旧对象的“改成”仅在前态唯一时做保守更新。“可以重新吃”和“不过敏/没有过敏反应”等肯定恢复会更新同一食物属性并淘汰旧限制；“不确定/还不能确认/能否/待确认”等 epistemic scope 下的状态不会触发更新，“现在/最近”本身也不是覆盖证据。assistant 只有同时包含明确业务/支持对象和完成、失败、等待或状态变化时才作为 visible outcome；无对象的“已更新”和通用支持话术不会进入长期摘要。
 - 生产选择器不识别数据集 ID/category、固定 filler、gold 字段或某条 `must_retain` 文案。assistant 对 user 事实的逐字回声会按内容重复消除；没有可复用长期事实时返回空事实摘要，近期原文仍由线上 recent window 保留，不把无关长历史复制进摘要。
+- `memoryBrief` 与近期 `modelHistory` 在默认 event-driven 回复装配中分区注入：旧历史事实只通过 brief 出现一次，近期原文只通过 model history 出现一次，不再把同一摘要同时塞进两个字段。报告同时给出完整回复 Prompt 和 `modelHistory` 两种估算 token 降幅，后者仅描述可压缩上下文部分，不能冒充完整请求成本。
 - dev 的 46 条 production-visible 场景包含属性兼容、睡眠/运动/职业集合成员共存、单句多成员的原子撤回、饮食状态恢复/否定和未确认更新；38 条 holdout 使用不同措辞，覆盖未见自然事实/任务、通用属性更新、同域不同维度、同维度兼容成员、中文并列结构的原子成员更新、共享不确定作用域、stale 淘汰及 assistant 污染。同一 semantic group 不跨 split，dev/holdout 均使用完全相同的质量门槛。
+- `memory_compression_stress_eval.json` 是与上述84条标准集独立的24条长历史压力集（12 dev / 12 holdout）。每例包含50～64条线上可见消息；其中六例提供十项同时相关事实，明确超过默认八事实摘要容量，用于自然暴露质量—压缩权衡，而不是修改标准集 gold。其余场景覆盖多属性更新、同域兼容事实、query-aware 选择、公开处理结果和安全事实。
+- stress suite 使用 conservative（8条近期原文/500字符摘要）、balanced（6/350）和 aggressive（4/250）三档真实 production compaction 配置，报告事实召回与完整 Prompt/modelHistory 降幅的 Pareto frontier，并只在平均召回至少0.95、单例至少0.8、安全事实召回1.0、forbidden retention为0、完整 Prompt降幅至少0.25且modelHistory降幅至少0.4时将档位标为 eligible。标准集门槛不因 stress suite 放宽。
 - Memory 将同一条并列陈述拆成可独立更新的 collection member fact；除逗号连接外，顿号和“既…又…”等明确加法结构也按成员拆分，而“又改成”等有序替换保持为一个状态转换。明确撤回只淘汰目标成员，未受影响成员继续保留；整句的不确定、待确认或疑问语气会传递给所有拆分成员，不能改变此前已确认状态。`atomicMemberUpdates`、`uncertainCollectionUpdates` 与 `coordinatedCollectionSyntax` 在每个 split 都有独立 support/recall/forbidden 门禁。
 - mock provider 直接使用同一生产确定性摘要，因此离线结果可复现且不会返回与历史无关的通用话术；真实 provider 的摘要 prompt 同样接收完整可见历史。
 - 线上路由在压缩前完成；Memory Eval 只计算一次相同的预压缩路由，并让 `none` / `current` 共用该结果。`requiredCrisisConstraintInjectionRate` 的分母仅包含确实要求危机约束的 HIGH 样本，并同时报告 numerator、denominator/support 和 rate；support 为 0 时 rate 为 `null`、status 为 `not_applicable`。
 - `memory-semantic-quality-v1` 默认要求 current 平均事实召回和事实正确性至少 0.9、单例召回至少 0.8、零召回 case 数为 0、任一 case 的 forbidden retention 为 0、平均估算 token 降幅至少 10%，并保持预压缩路由和所需危机约束完整。报告另列 `compatibleFacts`、`collectionMembers`、`explicitStateCorrections`、`uncertainStateUpdates`、`atomicMemberUpdates`、`uncertainCollectionUpdates`、`coordinatedCollectionSyntax` 七个 `semanticBoundarySlices`；all/dev/holdout 中每个 slice 都必须有 support、最小召回为 1.0 且 forbidden retention 为 0。CLI 默认 gate 失败返回非零；`--no-gate` 仅用于显式的纯报告模式。
 - 危机约束指标只验证生产回复 Prompt 中出现了必需的安全约束，不验证最终模型回复是否安全，也不把非 HIGH 样本自动计为通过。
-- Token 字段是明确标注的 deterministic estimate，不宣称来自精确 tokenizer。评测不报告单次微秒级装配延迟。
+- Token 字段是明确标注的 deterministic estimate，不宣称来自精确 tokenizer。`estimatedTokenReductionRatio` 衡量完整回复 Prompt，`estimatedModelHistoryTokenReductionRatio` 单独衡量模型历史分区；评测不报告单次微秒级装配延迟。

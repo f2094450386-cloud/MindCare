@@ -15,6 +15,30 @@
   --ok: #147d52;
 }
 
+/* 秋招补充：历史会话沿用原学生端布局。 */
+.history-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.history-head h3 { margin: 0; }
+.history-state { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.history-list { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; }
+.history-item {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+}
+.history-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item span, .history-empty span { color: var(--muted); font-size: 12px; }
+.history-item:hover, .history-item.active { border-color: var(--student); background: #edf7f4; }
+.history-item:focus-visible { outline: 2px solid var(--student); outline-offset: 2px; }
+.history-empty { display: grid; gap: 6px; padding: 12px 0; overflow-wrap: anywhere; }
+.history-empty.error { color: var(--danger); }
+
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 

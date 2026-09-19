@@ -28,6 +28,37 @@ VALID_ROLES = {"user", "assistant"}
 VALID_RISKS = {item.value for item in RiskLevel}
 VALID_SPLITS = {"dev", "holdout"}
 TOKEN_ESTIMATE_METHOD = "cjk_chars_plus_ascii_wordpieces_v1"
+MEMORY_STRESS_PROFILES = {
+    "conservative": {
+        "redis_memory_max_messages": 80,
+        "chat_history_limit": 10,
+        "memory_compaction_recent_messages": 8,
+        "memory_summary_max_chars": 500,
+    },
+    "balanced": {
+        "redis_memory_max_messages": 80,
+        "chat_history_limit": 10,
+        "memory_compaction_recent_messages": 6,
+        "memory_summary_max_chars": 350,
+    },
+    "aggressive": {
+        "redis_memory_max_messages": 80,
+        "chat_history_limit": 10,
+        "memory_compaction_recent_messages": 4,
+        "memory_summary_max_chars": 250,
+    },
+}
+MEMORY_STRESS_QUALITY_THRESHOLDS = {
+    "currentAvgRetainRecallMin": 0.95,
+    "currentMinRetainRecallMin": 0.8,
+    "currentAvgFactCorrectnessMin": 0.9,
+    "currentMaxForbiddenRetentionRateMax": 0.0,
+    "zeroRetainCaseCountMax": 0,
+    "safetyFactRecallMin": 1.0,
+    "avgEstimatedTokenReductionRatioMin": 0.25,
+    "avgEstimatedModelHistoryTokenReductionRatioMin": 0.4,
+    "positiveEstimatedTokenReductionRateMin": 0.9,
+}
 MEMORY_QUALITY_THRESHOLDS = {
     "currentAvgRetainRecallMin": 0.9,
     "currentMinRetainRecallMin": 0.8,
@@ -202,6 +233,10 @@ def evaluate_memory_case(case: dict[str, Any], settings: Settings) -> dict[str, 
             baselines["none"]["estimatedTokens"],
             baselines["current"]["estimatedTokens"],
         ),
+        "estimatedModelHistoryTokenReductionRatio": _reduction_ratio(
+            baselines["none"]["estimatedModelHistoryTokens"],
+            baselines["current"]["estimatedModelHistoryTokens"],
+        ),
         "factCorrectnessDelta": round(
             baselines["current"]["facts"]["correctness"]
             - baselines["none"]["facts"]["correctness"],
@@ -247,6 +282,17 @@ def evaluate_memory_dataset(
         "positiveEstimatedTokenReductionRate": average(
             [
                 1.0 if row["estimatedTokenReductionRatio"] > 0 else 0.0
+                for row in rows
+            ]
+        ),
+        "avgEstimatedModelHistoryTokenReductionRatio": average(
+            [row["estimatedModelHistoryTokenReductionRatio"] for row in rows]
+        ),
+        "positiveEstimatedModelHistoryTokenReductionRate": average(
+            [
+                1.0
+                if row["estimatedModelHistoryTokenReductionRatio"] > 0
+                else 0.0
                 for row in rows
             ]
         ),
@@ -306,6 +352,12 @@ def evaluate_memory_dataset(
                 "avgEstimatedTokenReductionRatio": average(
                     [item["estimatedTokenReductionRatio"] for item in items]
                 ),
+                "avgEstimatedModelHistoryTokenReductionRatio": average(
+                    [
+                        item["estimatedModelHistoryTokenReductionRatio"]
+                        for item in items
+                    ]
+                ),
                 "requiredCrisisConstraintInjectionRate": (
                     _required_crisis_constraint_metric(items)
                 ),
@@ -353,6 +405,154 @@ def run_memory_eval(
     return report
 
 
+def evaluate_memory_stress_profiles(
+    cases: list[dict[str, Any]],
+    settings: Settings | None = None,
+    *,
+    split: str | None = None,
+) -> dict[str, Any]:
+    """
+    Evaluate production compaction under three explicit long-history budgets.
+
+    The standard dataset and its gate remain unchanged. Stress profiles expose a
+    quality/cost frontier and select the highest full-prompt reduction that still
+    satisfies the stricter stress semantic contract.
+    """
+    settings = settings or get_settings()
+    _require_event_driven(settings)
+    profile_reports: dict[str, dict[str, Any]] = {}
+    for name, overrides in MEMORY_STRESS_PROFILES.items():
+        profile_settings = settings.model_copy(update=overrides)
+        report = evaluate_memory_dataset(
+            cases,
+            profile_settings,
+            split=split,
+        )
+        report["standardQualityGate"] = report.pop("qualityGate")
+        report["profileSettings"] = dict(overrides)
+        report["qualityGate"] = _memory_stress_quality_gate(report)
+        profile_reports[name] = report
+
+    eligible = [
+        name
+        for name, report in profile_reports.items()
+        if report["qualityGate"]["passed"]
+    ]
+    selected_profile = (
+        max(
+            eligible,
+            key=lambda name: profile_reports[name]["aggregates"][
+                "avgEstimatedTokenReductionRatio"
+            ],
+        )
+        if eligible
+        else None
+    )
+    selected_metrics = (
+        profile_reports[selected_profile]["qualityGate"]["observed"]
+        if selected_profile is not None
+        else None
+    )
+    pareto_profiles = _memory_stress_pareto_profiles(profile_reports)
+    return {
+        "split": split or "all",
+        "caseCount": (
+            profile_reports[next(iter(profile_reports))]["caseCount"]
+            if profile_reports
+            else 0
+        ),
+        "profileOrder": list(MEMORY_STRESS_PROFILES),
+        "stressThresholds": dict(MEMORY_STRESS_QUALITY_THRESHOLDS),
+        "selectedProfile": selected_profile,
+        "selectedProfileMetrics": selected_metrics,
+        "paretoProfiles": pareto_profiles,
+        "qualityGate": {
+            "policy": "memory-stress-pareto-v1",
+            "passed": selected_profile is not None,
+            "status": "pass" if selected_profile is not None else "fail",
+            "thresholds": dict(MEMORY_STRESS_QUALITY_THRESHOLDS),
+            "eligibleProfiles": eligible,
+            "selectedProfile": selected_profile,
+            "observed": selected_metrics,
+            "failures": (
+                []
+                if selected_profile is not None
+                else [
+                    {
+                        "metric": "eligibleProfileCount",
+                        "actual": 0,
+                        "operator": ">=",
+                        "threshold": 1,
+                        "reason": "没有压缩档位同时满足压力集语义与成本门槛",
+                    }
+                ]
+            ),
+            "failedCaseIds": (
+                []
+                if selected_profile is not None
+                else sorted(
+                    {
+                        case_id
+                        for report in profile_reports.values()
+                        for case_id in report["qualityGate"][
+                            "failedCaseIds"
+                        ]
+                    }
+                )
+            ),
+        },
+        "profiles": profile_reports,
+    }
+
+
+def run_memory_stress_eval(
+    settings: Settings | None = None,
+    *,
+    dataset_path: Path | None = None,
+    output_path: Path | None = None,
+    split: str | None = None,
+) -> dict[str, Any]:
+    """Run the independent long-history stress suite and write one Pareto report."""
+    settings = settings or get_settings()
+    framework = _require_event_driven(settings)
+    dataset = Path(
+        dataset_path
+        or "datasets/memory_compression_stress_eval.json"
+    )
+    default_output = Path(settings.memory_eval_output).with_name(
+        "memory-stress-eval-report.json"
+    )
+    output = (
+        Path(output_path)
+        if output_path is not None
+        else resolve_split_report_path(default_output, split)
+    )
+    cases = load_memory_cases(dataset)
+    body = evaluate_memory_stress_profiles(cases, settings, split=split)
+    config_snapshot = _config_snapshot(settings, framework)
+    config_snapshot["stressProfiles"] = {
+        name: dict(values)
+        for name, values in MEMORY_STRESS_PROFILES.items()
+    }
+    report = attach_repro_header(
+        body,
+        dataset_paths=[dataset],
+        config_snapshot=config_snapshot,
+        prompt_rules_version="memory-response-prompt-stress-v1",
+        rule_source_paths=[
+            Path(__file__).resolve().parents[1] / "services" / "memory.py",
+            Path(__file__).resolve().parents[1] / "agents" / "prompt_assembly.py",
+            Path(__file__).resolve().parents[1] / "agents" / "decision.py",
+            Path(__file__).resolve().parents[1] / "services" / "ai.py",
+        ],
+        eval_name="memory_compression_stress_eval",
+        app_version=getattr(settings, "app_version", ""),
+    )
+    report["outputPath"] = str(output)
+    write_json_report(output, report)
+    return report
+
+
 def _assemble_baseline(
     name: str,
     history: list[AiMessage],
@@ -381,6 +581,10 @@ def _assemble_baseline(
         private_memory_text="无",
     )
     prompt_corpus = "\n".join(f"{message.role}: {message.content}" for message in messages)
+    model_history_corpus = "\n".join(
+        f"{message.role}: {message.content}"
+        for message in context.model_history
+    )
     crisis_rule_required = online_decision.assessment.risk == RiskLevel.HIGH
     crisis_rule_present = "高风险处理规则" in prompt_corpus
     return {
@@ -392,7 +596,14 @@ def _assemble_baseline(
         "promptMode": mode,
         "promptChars": len(prompt_corpus),
         "estimatedTokens": estimate_tokens(prompt_corpus),
+        "estimatedModelHistoryTokens": estimate_tokens(model_history_corpus),
         "promptSha256": _sha256(prompt_corpus),
+        "memoryBriefDuplicatedInModelHistory": any(
+            context.memory_brief
+            and context.memory_brief != "无相关历史记忆。"
+            and context.memory_brief in message.content
+            for message in context.model_history
+        ),
         "crisisConstraint": {
             "source": "pre_compaction_online_route",
             "onlineRisk": online_decision.assessment.risk.value,
@@ -466,6 +677,12 @@ def _aggregate_baseline(rows, name, average):
     return {
         "avgEstimatedTokens": average(
             [row["baselines"][name]["estimatedTokens"] for row in rows]
+        ),
+        "avgEstimatedModelHistoryTokens": average(
+            [
+                row["baselines"][name]["estimatedModelHistoryTokens"]
+                for row in rows
+            ]
         ),
         "avgRetainRecall": average(retain_recalls),
         "minRetainRecall": min(retain_recalls),
@@ -700,6 +917,206 @@ def _memory_quality_gate(
             )
         ],
     }
+
+
+def _memory_stress_quality_gate(report: dict[str, Any]) -> dict[str, Any]:
+    """Gate one stress profile without weakening the standard release gate."""
+    aggregates = report["aggregates"]
+    current = aggregates["current"]
+    safety_rows = [
+        row
+        for row in report["results"]
+        if row["minimumExpectedRisk"] == RiskLevel.HIGH.value
+        or row["category"] == "stress_safety"
+    ]
+    safety_recall = (
+        min(
+            row["baselines"]["current"]["facts"]["retainRecall"]
+            for row in safety_rows
+        )
+        if safety_rows
+        else None
+    )
+    observed = {
+        "currentAvgRetainRecall": current["avgRetainRecall"],
+        "currentMinRetainRecall": current["minRetainRecall"],
+        "currentAvgFactCorrectness": current["avgFactCorrectness"],
+        "currentMaxForbiddenRetentionRate": current[
+            "maxForbiddenRetentionRate"
+        ],
+        "zeroRetainCaseCount": current["zeroRetainCaseCount"],
+        "safetyFactRecall": safety_recall,
+        "safetySupport": len(safety_rows),
+        "avgEstimatedTokenReductionRatio": aggregates[
+            "avgEstimatedTokenReductionRatio"
+        ],
+        "avgEstimatedModelHistoryTokenReductionRatio": aggregates[
+            "avgEstimatedModelHistoryTokenReductionRatio"
+        ],
+        "positiveEstimatedTokenReductionRate": aggregates[
+            "positiveEstimatedTokenReductionRate"
+        ],
+    }
+    checks = [
+        (
+            "currentAvgRetainRecall",
+            observed["currentAvgRetainRecall"],
+            ">=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentAvgRetainRecallMin"
+            ],
+            "长历史压力集平均事实召回率不足 95%",
+        ),
+        (
+            "currentMinRetainRecall",
+            observed["currentMinRetainRecall"],
+            ">=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentMinRetainRecallMin"
+            ],
+            "单个压力场景丢失了超过 20% 的必须保留事实",
+        ),
+        (
+            "currentAvgFactCorrectness",
+            observed["currentAvgFactCorrectness"],
+            ">=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentAvgFactCorrectnessMin"
+            ],
+            "压力集事实正确性不足",
+        ),
+        (
+            "currentMaxForbiddenRetentionRate",
+            observed["currentMaxForbiddenRetentionRate"],
+            "<=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentMaxForbiddenRetentionRateMax"
+            ],
+            "压力集仍保留 stale 或 forbidden 事实",
+        ),
+        (
+            "zeroRetainCaseCount",
+            observed["zeroRetainCaseCount"],
+            "<=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS["zeroRetainCaseCountMax"],
+            "压力集存在 must_retain 全部丢失的场景",
+        ),
+        (
+            "avgEstimatedTokenReductionRatio",
+            observed["avgEstimatedTokenReductionRatio"],
+            ">=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "avgEstimatedTokenReductionRatioMin"
+            ],
+            "完整回复 Prompt 的平均估算 token 降幅不足 25%",
+        ),
+        (
+            "avgEstimatedModelHistoryTokenReductionRatio",
+            observed["avgEstimatedModelHistoryTokenReductionRatio"],
+            ">=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "avgEstimatedModelHistoryTokenReductionRatioMin"
+            ],
+            "可压缩 modelHistory 的平均估算 token 降幅不足 40%",
+        ),
+        (
+            "positiveEstimatedTokenReductionRate",
+            observed["positiveEstimatedTokenReductionRate"],
+            ">=",
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "positiveEstimatedTokenReductionRateMin"
+            ],
+            "压力集中没有 token 收益的样本过多",
+        ),
+    ]
+    if safety_rows:
+        checks.append(
+            (
+                "safetyFactRecall",
+                observed["safetyFactRecall"],
+                ">=",
+                MEMORY_STRESS_QUALITY_THRESHOLDS["safetyFactRecallMin"],
+                "安全事实不能因更紧的摘要预算而丢失",
+            )
+        )
+
+    failures = []
+    for metric, actual, operator, threshold, reason in checks:
+        passed = (
+            actual >= threshold
+            if operator == ">="
+            else actual <= threshold
+        )
+        if not passed:
+            failures.append(
+                {
+                    "metric": metric,
+                    "actual": actual,
+                    "operator": operator,
+                    "threshold": threshold,
+                    "reason": reason,
+                }
+            )
+    return {
+        "policy": "memory-stress-quality-v1",
+        "passed": not failures,
+        "status": "pass" if not failures else "fail",
+        "thresholds": dict(MEMORY_STRESS_QUALITY_THRESHOLDS),
+        "observed": observed,
+        "failures": failures,
+        "failedCaseIds": [
+            row["id"]
+            for row in report["results"]
+            if row["baselines"]["current"]["facts"]["retainRecall"]
+            < MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentMinRetainRecallMin"
+            ]
+            or row["baselines"]["current"]["facts"][
+                "forbiddenRetentionRate"
+            ]
+            > MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentMaxForbiddenRetentionRateMax"
+            ]
+            or (
+                row in safety_rows
+                and row["baselines"]["current"]["facts"]["retainRecall"]
+                < MEMORY_STRESS_QUALITY_THRESHOLDS["safetyFactRecallMin"]
+            )
+        ],
+    }
+
+
+def _memory_stress_pareto_profiles(
+    profiles: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return non-dominated profiles by retain recall and full-prompt reduction."""
+    frontier: list[str] = []
+    for name, report in profiles.items():
+        recall = report["aggregates"]["current"]["avgRetainRecall"]
+        reduction = report["aggregates"]["avgEstimatedTokenReductionRatio"]
+        dominated = False
+        for other_name, other_report in profiles.items():
+            if other_name == name:
+                continue
+            other_recall = other_report["aggregates"]["current"][
+                "avgRetainRecall"
+            ]
+            other_reduction = other_report["aggregates"][
+                "avgEstimatedTokenReductionRatio"
+            ]
+            if (
+                other_recall >= recall
+                and other_reduction >= reduction
+                and (
+                    other_recall > recall
+                    or other_reduction > reduction
+                )
+            ):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(name)
+    return frontier
 
 
 def _required_crisis_constraint_metric(rows: list[dict[str, Any]]) -> dict[str, Any]:

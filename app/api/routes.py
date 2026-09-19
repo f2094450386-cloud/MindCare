@@ -7,6 +7,8 @@ MindBridge API 路由定义
 - GET  /actuator/health          → 健康检查
 - GET  /api/profile              → 当前用户信息
 - POST /api/chat/stream          → SSE 流式聊天（仅学生可用）
+- GET  /api/chat/sessions        → 当前学生的历史会话
+- GET  /api/chat/sessions/{id}   → 当前学生的会话消息
 - GET  /api/agent/status         → Agent 状态信息
 - GET  /api/reports/me           → 我的心理报告
 
@@ -88,6 +90,27 @@ async def chat_stream(
         raise HTTPException(403, "管理员账号只能查看后台记录，不能发起学生对话。")
     service = ChatService(db, get_settings())
     return StreamingResponse(service.stream_chat(user, request), media_type="text/event-stream")
+
+
+@router.get("/api/chat/sessions")
+def chat_sessions(user: Annotated[UserAccount, Depends(current_user)], db: Annotated[Session, Depends(get_db)]):
+    if "ROLE_ADMIN" in user.roles:
+        raise HTTPException(403, "管理员账号不能访问学生会话列表。")
+    return ReportService(db).student_sessions(user.id)
+
+
+@router.get("/api/chat/sessions/{session_id}")
+def chat_conversation(
+    session_id: str,
+    user: Annotated[UserAccount, Depends(current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    if "ROLE_ADMIN" in user.roles:
+        raise HTTPException(403, "管理员账号不能通过学生接口读取会话。")
+    try:
+        return ReportService(db).student_conversation(session_id, user.id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @router.get("/api/agent/status")

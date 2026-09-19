@@ -14,9 +14,15 @@ from pathlib import Path
 def main(argv: list[str] | None = None) -> int:
     """Memory 压缩评测入口。"""
     from app.core.config import Settings
-    from app.memory_eval import run_memory_eval
+    from app.memory_eval import run_memory_eval, run_memory_stress_eval
 
     parser = argparse.ArgumentParser(description="Run MindCare long-dialogue memory compression evaluation.")
+    parser.add_argument(
+        "--suite",
+        choices=["standard", "stress"],
+        default="standard",
+        help="standard 保持正式门禁；stress 运行三档长历史 Pareto 评测",
+    )
     parser.add_argument("--dataset", type=str, default=None, help="场景 JSON 路径")
     parser.add_argument("--output", type=str, default=None, help="报告输出路径")
     parser.add_argument(
@@ -40,7 +46,12 @@ def main(argv: list[str] | None = None) -> int:
         agent_framework="event_driven_multi_agent",
     )
 
-    report = run_memory_eval(
+    runner = (
+        run_memory_stress_eval
+        if args.suite == "stress"
+        else run_memory_eval
+    )
+    report = runner(
         settings,
         dataset_path=Path(args.dataset) if args.dataset else None,
         output_path=Path(args.output) if args.output else None,
@@ -52,7 +63,12 @@ def main(argv: list[str] | None = None) -> int:
         "git": report.get("repro", {}).get("git", {}).get("shortCommit"),
         "caseCount": report.get("caseCount"),
         "split": report.get("split"),
-        "aggregates": report.get("aggregates"),
+        "aggregates": (
+            report.get("aggregates")
+            or report.get("selectedProfileMetrics")
+        ),
+        "selectedProfile": report.get("selectedProfile"),
+        "paretoProfiles": report.get("paretoProfiles"),
         "qualityGate": report.get("qualityGate"),
         "qualityGateEnforced": not args.no_gate,
         "output": report.get("outputPath"),

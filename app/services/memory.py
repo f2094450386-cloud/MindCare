@@ -272,6 +272,7 @@ def assemble_memory_context(
         sanitized,
         compaction_settings,
         sanitized_input,
+        include_summary_message=False,
     )
     brief = memory_brief if memory_brief is not None else deterministic_brief
     artifact_message = _artifact_memory_message(artifacts or [])
@@ -371,6 +372,8 @@ def compact_history_for_prompt(
     history: list[AiMessage],
     settings: MemoryCompactionSettings,
     current_input: str = "",
+    *,
+    include_summary_message: bool = True,
 ) -> tuple[list[AiMessage], str]:
     """
     压缩历史消息用于注入 prompt，同时返回学生不可见的记忆摘要。
@@ -391,14 +394,19 @@ def compact_history_for_prompt(
         return sanitized, brief
 
     recent = sanitized[-recent_count:]
-    summary_message = AiMessage(
-        role="system",
-        content=(
-            "历史摘要（仅供 MindBridge 内部上下文使用；不要向学生展示；"
-            "不要据此输出诊断、风险等级或后台标签）：\n" + brief
-        ),
-    )
-    return [summary_message, *recent], brief
+    if include_summary_message:
+        summary_message = AiMessage(
+            role="system",
+            content=(
+                "历史摘要（仅供 MindBridge 内部上下文使用；不要向学生展示；"
+                "不要据此输出诊断、风险等级或后台标签）：\n" + brief
+            ),
+        )
+        return [summary_message, *recent], brief
+
+    # 默认 event-driven ResponseAgent 已通过独立的 memoryBrief 字段注入摘要。
+    # modelHistory 只保留近期原文，避免同一摘要在最终 prompt 中出现两次。
+    return recent, brief
 
 
 def summarize_history_for_memory(
@@ -491,6 +499,10 @@ _MEMORY_STABLE_STATEMENT_PATTERN = re.compile(
     r"|^(?:请|不要|别)(?:用|避免|在|把|给|催|提|说|回复|解释)"
     r"|^(?:饮食上|交流时|学习时|工作时|晚上|每周|周末|平时)"
     r")",
+    re.IGNORECASE,
+)
+_MEMORY_FIRST_PERSON_DECLARATION_PATTERN = re.compile(
+    r"^(?:我|本人)(?:[^？?]{2,})$",
     re.IGNORECASE,
 )
 _MEMORY_UPDATE_PATTERN = re.compile(
@@ -636,7 +648,7 @@ _MEMORY_COMMUNICATION_MEDIUM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _MEMORY_COMMUNICATION_SCOPE_REPLACEMENT_PATTERN = re.compile(
-    r"(?:只想|只要|只能|只用|统一用|全部改用)",
+    r"(?:只想|只要|只能|只用|只接受|只采用|只选择|统一用|全部改用)",
     re.IGNORECASE,
 )
 _MEMORY_COLLECTION_SCOPE_REPLACEMENT_PATTERN = re.compile(
@@ -930,6 +942,7 @@ def _memory_fact_kind(role: str, content: str) -> str | None:
         return "open_task"
     if (
         _MEMORY_STABLE_STATEMENT_PATTERN.search(content)
+        or _MEMORY_FIRST_PERSON_DECLARATION_PATTERN.search(content)
         or _MEMORY_UPDATE_PATTERN.search(content)
     ):
         return "stable_user_fact"

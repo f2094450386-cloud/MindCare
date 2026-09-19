@@ -23,9 +23,12 @@ from app.core.version import (
 from app.eval import classification_metrics, resolve_split_report_path
 from app.memory_eval import (
     MEMORY_QUALITY_THRESHOLDS,
+    MEMORY_STRESS_PROFILES,
+    MEMORY_STRESS_QUALITY_THRESHOLDS,
     estimate_tokens,
     evaluate_memory_case,
     evaluate_memory_dataset,
+    evaluate_memory_stress_profiles,
     load_memory_cases,
     run_memory_eval,
 )
@@ -38,6 +41,10 @@ from app.route_eval import (
     run_route_eval,
 )
 from app.route_eval.runner import _gate_exit_code as route_gate_exit_code
+from app.route_eval.suite_runner import (
+    _exit_code as route_suite_exit_code,
+    run_route_suite,
+)
 from app.schemas.dtos import AiMessage
 from app.services.ai import (
     has_high_risk_signal,
@@ -50,8 +57,19 @@ from app.services.memory import (
     assemble_memory_context,
     summarize_history_for_memory,
 )
-from scripts.build_memory_eval_dataset import build_cases as build_memory_cases
+from scripts.build_memory_eval_dataset import (
+    build_cases as build_memory_cases,
+    build_stress_cases as build_memory_stress_cases,
+)
+from scripts.build_route_challenge_dataset import (
+    SOURCE as ROUTE_CHALLENGE_SOURCE,
+    build_cases as build_route_challenge_cases,
+)
 from scripts.build_route_eval_dataset import build_cases as build_route_cases
+from scripts.build_route_standard_dataset import (
+    SOURCE as ROUTE_STANDARD_SOURCE,
+    build_cases as build_route_standard_cases,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1195,6 +1213,63 @@ class DatasetContractTests(unittest.TestCase):
         self.assertTrue(failed_report["qualityGate"]["observed"])
         self.assertTrue(failed_report["qualityGate"]["failures"])
 
+    def test_route_suite_merges_execution_but_keeps_suite_metrics_separate(self):
+        counts = {
+            "route_eval.jsonl": 176,
+            "route_standard_eval.jsonl": 100,
+            "route_challenge_eval.jsonl": 60,
+        }
+
+        def fake_run_route_eval(settings, *, dataset_path, output_path):
+            del settings
+            count = counts[Path(dataset_path).name]
+            return {
+                "caseCount": count,
+                "intent": {"accuracy": 0.8, "macroF1": 0.75},
+                "risk": {"accuracy": 0.85, "macroF1": 0.8},
+                "riskRecall": 0.7,
+                "riskFalsePositiveRate": 0.1,
+                "riskSupport": 10,
+                "safetyOverrideAccuracy": 0.9,
+                "badCases": [{}],
+                "qualityGate": {"passed": Path(dataset_path).name == "route_eval.jsonl"},
+                "repro": {"datasets": [{"sha256": f"hash-{count}"}]},
+                "outputPath": str(output_path),
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "route-suite-report.json"
+            with patch(
+                "app.route_eval.suite_runner.run_route_eval",
+                side_effect=fake_run_route_eval,
+            ) as run_mock:
+                manifest = run_route_suite(
+                    eval_settings(),
+                    dataset_dir=root / "datasets",
+                    output_dir=root / "reports",
+                    output_path=output,
+                )
+
+            self.assertEqual(run_mock.call_count, 3)
+            self.assertEqual(manifest["caseCount"], 336)
+            self.assertTrue(manifest["aggregation"]["executionMerged"])
+            self.assertIsNone(manifest["aggregation"]["blendedMetrics"])
+            self.assertEqual(
+                [item["key"] for item in manifest["suites"]],
+                ["regression", "standard", "challenge"],
+            )
+            self.assertEqual(manifest["suites"][1]["metricRole"], "primary_benchmark")
+            self.assertTrue(manifest["suites"][0]["gate"]["enforced"])
+            self.assertFalse(manifest["suites"][1]["gate"]["enforced"])
+            self.assertEqual(route_suite_exit_code(manifest, no_gate=False), 0)
+            self.assertTrue(output.exists())
+
+            failed_manifest = json.loads(json.dumps(manifest))
+            failed_manifest["suites"][0]["gate"]["passed"] = False
+            self.assertEqual(route_suite_exit_code(failed_manifest, no_gate=False), 2)
+            self.assertEqual(route_suite_exit_code(failed_manifest, no_gate=True), 0)
+
     def test_known_paraphrase_family_does_not_leak_across_split(self):
         cases = load_route_cases(ROOT / "datasets" / "route_eval.jsonl")
         by_text = {
@@ -1257,9 +1332,100 @@ class DatasetContractTests(unittest.TestCase):
 
     def test_builders_match_static_datasets_item_for_item(self):
         route_static = load_route_cases(ROOT / "datasets" / "route_eval.jsonl")
+        route_standard_static = load_route_cases(
+            ROOT / "datasets" / "route_standard_eval.jsonl"
+        )
+        route_challenge_static = load_route_cases(
+            ROOT / "datasets" / "route_challenge_eval.jsonl"
+        )
         memory_static = load_memory_cases(ROOT / "datasets" / "memory_compression_eval.json")
+        memory_stress_static = load_memory_cases(
+            ROOT / "datasets" / "memory_compression_stress_eval.json"
+        )
         self.assertEqual(build_route_cases(), route_static)
+        self.assertEqual(build_route_standard_cases(), route_standard_static)
+        self.assertEqual(build_route_challenge_cases(), route_challenge_static)
         self.assertEqual(build_memory_cases(), memory_static)
+        self.assertEqual(build_memory_stress_cases(), memory_stress_static)
+
+    def test_route_standard_dataset_has_common_language_distribution_and_no_overlap(self):
+        standard = build_route_standard_cases()
+        regression = build_route_cases()
+        challenge = build_route_challenge_cases()
+
+        self.assertEqual(len(standard), 100)
+        self.assertEqual(
+            Counter(case["expected_intent"] for case in standard),
+            Counter({"CHAT": 40, "CONSULT": 36, "RISK": 24}),
+        )
+        self.assertEqual(
+            Counter(case["expected_risk"] for case in standard),
+            Counter({"LOW": 60, "MEDIUM": 16, "HIGH": 24}),
+        )
+        self.assertEqual(
+            Counter(case["split"] for case in standard),
+            Counter({"dev": 50, "holdout": 50}),
+        )
+        self.assertEqual({case["source"] for case in standard}, {ROUTE_STANDARD_SOURCE})
+        self.assertTrue(
+            all(
+                len(case["messages"]) == 1
+                and "common_user_language" in case["tags"]
+                and "single_turn" in case["tags"]
+                for case in standard
+            )
+        )
+
+        group_splits: dict[str, set[str]] = {}
+        for case in standard:
+            group_splits.setdefault(case["group"], set()).add(case["split"])
+        self.assertTrue(all(len(splits) == 1 for splits in group_splits.values()))
+
+        def message_key(case: dict) -> str:
+            return json.dumps(case["messages"], ensure_ascii=False, sort_keys=True)
+
+        standard_messages = {message_key(case) for case in standard}
+        other_messages = {
+            message_key(case)
+            for case in [*regression, *challenge]
+        }
+        self.assertTrue(standard_messages.isdisjoint(other_messages))
+
+    def test_route_challenge_dataset_has_frozen_distribution_and_no_exact_overlap(self):
+        challenge = build_route_challenge_cases()
+        regression = build_route_cases()
+
+        self.assertEqual(len(challenge), 60)
+        self.assertEqual(
+            Counter(case["expected_intent"] for case in challenge),
+            Counter({"CHAT": 20, "CONSULT": 20, "RISK": 20}),
+        )
+        self.assertEqual(
+            Counter(case["expected_risk"] for case in challenge),
+            Counter({"LOW": 28, "MEDIUM": 10, "HIGH": 22}),
+        )
+        self.assertEqual(
+            Counter(case["split"] for case in challenge),
+            Counter({"dev": 30, "holdout": 30}),
+        )
+        self.assertEqual(
+            {case["source"] for case in challenge},
+            {ROUTE_CHALLENGE_SOURCE},
+        )
+
+        group_splits: dict[str, set[str]] = {}
+        for case in challenge:
+            group_splits.setdefault(case["group"], set()).add(case["split"])
+        self.assertTrue(all(len(splits) == 1 for splits in group_splits.values()))
+
+        def message_key(case: dict) -> str:
+            return json.dumps(case["messages"], ensure_ascii=False, sort_keys=True)
+
+        self.assertTrue(
+            {message_key(case) for case in challenge}.isdisjoint(
+                {message_key(case) for case in regression}
+            )
+        )
 
 
 class MemoryEvaluationTests(unittest.TestCase):
@@ -1288,6 +1454,9 @@ class MemoryEvaluationTests(unittest.TestCase):
         self.assertIn("promptSha256", current)
         self.assertGreater(none["estimatedTokens"], 0)
         self.assertGreater(current["estimatedTokens"], 0)
+        self.assertGreater(none["estimatedModelHistoryTokens"], 0)
+        self.assertGreater(current["estimatedModelHistoryTokens"], 0)
+        self.assertFalse(current["memoryBriefDuplicatedInModelHistory"])
         self.assertNotEqual(none["promptSha256"], current["promptSha256"])
         self.assertGreater(estimate_tokens("中文 token estimate"), 0)
 
@@ -1372,6 +1541,74 @@ class MemoryEvaluationTests(unittest.TestCase):
                     boundary["maxForbiddenRetentionRate"],
                     0.0,
                 )
+
+    def test_independent_long_history_stress_suite_exposes_pareto_tradeoff(self):
+        cases = build_memory_stress_cases()
+        self.assertEqual(len(cases), 24)
+        self.assertEqual(
+            Counter(case["split"] for case in cases),
+            Counter({"dev": 12, "holdout": 12}),
+        )
+        standard_groups = {case["group"] for case in build_memory_cases()}
+        stress_groups = {case["group"] for case in cases}
+        self.assertFalse(standard_groups & stress_groups)
+        self.assertEqual(set(MEMORY_STRESS_PROFILES), {
+            "conservative",
+            "balanced",
+            "aggressive",
+        })
+
+        report = evaluate_memory_stress_profiles(cases, eval_settings())
+        self.assertTrue(report["qualityGate"]["passed"])
+        self.assertIsNotNone(report["selectedProfile"])
+        self.assertTrue(report["paretoProfiles"])
+        self.assertTrue(
+            any(
+                profile["aggregates"]["current"]["avgRetainRecall"] < 1.0
+                for profile in report["profiles"].values()
+            ),
+        )
+        selected = report["profiles"][report["selectedProfile"]]
+        observed = selected["qualityGate"]["observed"]
+        self.assertGreaterEqual(
+            observed["currentAvgRetainRecall"],
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentAvgRetainRecallMin"
+            ],
+        )
+        self.assertGreaterEqual(
+            observed["currentMinRetainRecall"],
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "currentMinRetainRecallMin"
+            ],
+        )
+        self.assertEqual(
+            observed["currentMaxForbiddenRetentionRate"],
+            0.0,
+        )
+        self.assertEqual(observed["safetyFactRecall"], 1.0)
+        self.assertGreaterEqual(
+            observed["avgEstimatedTokenReductionRatio"],
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "avgEstimatedTokenReductionRatioMin"
+            ],
+        )
+        self.assertGreaterEqual(
+            observed["avgEstimatedModelHistoryTokenReductionRatio"],
+            MEMORY_STRESS_QUALITY_THRESHOLDS[
+                "avgEstimatedModelHistoryTokenReductionRatioMin"
+            ],
+        )
+        for split in ("dev", "holdout"):
+            with self.subTest(split=split):
+                split_report = evaluate_memory_stress_profiles(
+                    cases,
+                    eval_settings(),
+                    split=split,
+                )
+                self.assertEqual(split_report["caseCount"], 12)
+                self.assertTrue(split_report["qualityGate"]["passed"])
+                self.assertIsNotNone(split_report["selectedProfile"])
 
     def test_memory_natural_paraphrase_holdout_retains_facts_and_reduces_tokens(self):
         holdout = [
@@ -1570,7 +1807,7 @@ class MemoryEvaluationTests(unittest.TestCase):
         )
         for fact in facts:
             self.assertIn(fact, context.memory_brief)
-            self.assertIn(fact, prompt_text)
+            self.assertNotIn(fact, prompt_text)
 
         row = evaluate_memory_case(
             {
@@ -1592,6 +1829,11 @@ class MemoryEvaluationTests(unittest.TestCase):
         self.assertEqual(
             row["baselines"]["current"]["facts"]["retainRecall"],
             1.0,
+        )
+        self.assertFalse(
+            row["baselines"]["current"][
+                "memoryBriefDuplicatedInModelHistory"
+            ],
         )
         self.assertGreater(row["estimatedTokenReductionRatio"], 0.0)
 
